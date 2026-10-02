@@ -107,7 +107,8 @@ target_compile_options(epic_cu PRIVATE -O3 -use_fast_math --ptxas-options=-v  -X
 
 set_target_properties( epic_cu
                        PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-set_target_properties(epic_cu PROPERTIES CUDA_ARCHITECTURES "89")
+set(EPIC_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA architectures for compilation and device linking")
+set_target_properties(epic_cu PROPERTIES CUDA_ARCHITECTURES "${EPIC_CUDA_ARCHITECTURES}")
 
 
 add_executable(epic++ src/main.cpp)
@@ -117,6 +118,7 @@ target_compile_options(epic++ PRIVATE -march=haswell -maes -O3 -pthread  -Wall -
 
 set_target_properties( epic++
                        PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(epic++ PROPERTIES CUDA_ARCHITECTURES "${EPIC_CUDA_ARCHITECTURES}")
 
 
 add_dependencies(epic++ raft hwy epiclib)
@@ -125,10 +127,16 @@ target_link_libraries(epic++ PRIVATE pybind11::embed raft hwy epiclib epic_cu cu
 glog::glog nvidia-ml pqxx pq ibverbs prometheus-cpp::pull cmake_git_version_tracking ${AV_LIBS}  
 )
 
-# file(GLOB PY_FILES "src/python/*.py")
-# file(COPY ${PY_FILES} DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+# Copy entire Python directory to build directory to ensure all modules work
+# This includes:
+# - All .py files (epic_utils.py, MCS2.py, daily_digest.py, etc.)
+# - All Python packages/subdirectories (epic_grpc/, etc.)
+file(COPY ${CMAKE_SOURCE_DIR}/src/python/
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}
+     FILES_MATCHING
+     PATTERN "*.py"
+     PATTERN "__pycache__" EXCLUDE)
 
-add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-                   COMMAND ${CMAKE_COMMAND} -E create_symlink
-                   ${CMAKE_SOURCE_DIR}/src/python/epic_utils.py $<TARGET_FILE_DIR:${PROJECT_NAME}>/epic_utils.py)
-
+# Also copy the epic_grpc directory (Python package)
+file(COPY ${CMAKE_SOURCE_DIR}/src/python/epic_grpc
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR})

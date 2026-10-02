@@ -23,8 +23,11 @@
 #ifndef SRC_EX_OPTION_PARSER_HPP_
 #define SRC_EX_OPTION_PARSER_HPP_
 #include <cxxopts.hpp>
+#include <cmath>
 #include <iostream>
 #include <iterator>
+#include <optional>
+#include <set>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -32,6 +35,7 @@
 #include "./constants.h"
 #include "./metrics.hpp"
 #include "./host_helpers.h"
+#include "./offline_config.hpp"
 #include "git.h"
 
 cxxopts::Options GetEpicOptions() {
@@ -58,19 +62,21 @@ cxxopts::Options GetEpicOptions() {
       "npytbnfile", "numpy-TBN data path", cxxopts::value<std::string>());
 
   options.add_options("Imaging options")(
+      "remove_autocorr", "Subtract physical-antenna self correlations from all four products",
+      cxxopts::value<bool>()->default_value("false"))(
       "imagesize", "1-D image size (can only be 64 or 128)",
       cxxopts::value<int>()->default_value("128"))(
       "imageres", "Pixel resolution in degrees",
       cxxopts::value<float>()->default_value("1.0"))(
       "nts", "Number of timestamps per span",
       cxxopts::value<int>()->default_value("1000"))(
-      "seq_accum", "Duration of the sequence accumulation in milliseconds",
+      "seq_accum", "Online accumulation duration in milliseconds; offline integrates one complete NPZ gulp",
       cxxopts::value<int>()->default_value("40"))(
       "nimg_accum", "Number of images to accumulate before saving to the disk",
       cxxopts::value<int>()->default_value("1"))(
-      "channels", "Number of channels in the output image",
-      cxxopts::value<int>()->default_value("128"))(
-      "support", "Support size of the kernel. Must be a non-zero power of 2",
+      "channels", "Input channels: offline total split across GPUs; online per instance; bandwidth = channels x 25 kHz",
+      cxxopts::value<int>()->default_value("1024"))(
+      "support", "Support size of the kernel (1 through 9)",
       cxxopts::value<int>()->default_value("2"))(
       "aeff", "Antenna effective area (experimental) in sq. m",
       cxxopts::value<std::vector<float>>()->default_value("25,16"))(
@@ -127,6 +133,12 @@ cxxopts::Options GetEpicOptions() {
 
 std::optional<std::string> ValidateOptions(const cxxopts::ParseResult& result) {
   using std::string_literals::operator""s;
+  // RunEpic validates before handling --help. No CUDA discovery is needed to
+  // print usage, including on hosts where CUDA initialization fails.
+  if (result.count("help")) return {};
+  const bool offline = result["offline"].as<bool>();
+  if (result.count("npytbnfile") && result["npytbnfile"].as<std::string>().empty())
+    return "npytbnfile must name a non-empty input path";
   auto ports = result["port"].as<std::vector<int>>();
   for (auto& port : ports) {
     if (port < 1 || port > 32768) {
@@ -141,12 +153,23 @@ std::optional<std::string> ValidateOptions(const cxxopts::ParseResult& result) {
            ". Image size can only be 64 or 128"s;
   }
 
-  int nts = result["nts"].as<int>() * 40e-3;
+  int nts = result["nts"].as<int>();
   int accumulate = result["seq_accum"].as<int>();
-
-  if (accumulate < nts) {
-    return "Sequence accumulation time must be greater than the gulp size."s;
+  if (nts <= 0) return "nts must be greater than 0";
+  if (nts > std::numeric_limits<int>::max() / SAMPLING_LEN_uS)
+    return "nts exceeds the integer timing range; use a smaller time tile";
+  if (accumulate <= 0) return "seq_accum must be greater than 0";
+  const double gulp_ms = nts * (SAMPLING_LEN_uS * 1e-3);
+  if (!offline && accumulate < gulp_ms) {
+    return "Online sequence accumulation must cover a complete input gulp";
   }
+  const int image_accum = result["nimg_accum"].as<int>();
+  if (image_accum <= 0) return "nimg_accum must be greater than 0";
+  if (offline && image_accum != 1)
+    return "Offline processes one NPZ gulp; nimg_accum must be 1";
+  const float resolution = result["imageres"].as<float>();
+  if (!std::isfinite(resolution) || resolution <= 0)
+    return "imageres must be positive and finite";
 
   int channels = result["channels"].as<int>();
   if (channels <= 0) {
@@ -158,17 +181,7 @@ std::optional<std::string> ValidateOptions(const cxxopts::ParseResult& result) {
   if (ndevices <= 0) {
     return "ngpus must be greater than 0";
   }
-
-  if (ndevices > GetNumGpus()) {
-    return "Y'all must be kidding. You said EPIC must be run on " +
-           std::to_string(ndevices) + " gpu(s) but only " +
-           std::to_string(GetNumGpus()) + " available!";
-  }
-
-  if (channels > MAX_CHANNELS_4090) {
-    return "RTX 4090 only supports output channels upto "s +
-           std::to_string(MAX_CHANNELS_4090);
-  }
+  if (ndevices > 3) return "This executor supports at most 3 GPUs";
 
   auto aeffs = result["aeff"].as<std::vector<float>>();
   if (aeffs.size() < ndevices) {
@@ -176,16 +189,9 @@ std::optional<std::string> ValidateOptions(const cxxopts::ParseResult& result) {
   }
 
   for (auto aeff : aeffs) {
-    if (aeff <= 0) {
+    if (!std::isfinite(aeff) || aeff <= 0) {
       return "Antenna effective cannot be smaller than or equal to zero:  "s +
              std::to_string(aeff);
-    }
-  }
-
-  if (result["gpu_ids"].count() > 0) {
-    auto gpu_ids = result["gpu_ids"].as<std::vector<int>>();
-    if (gpu_ids.size() > 0 && gpu_ids.size() != ndevices) {
-      "A gpu ID must be specifed for each EPIC instance";
     }
   }
 
@@ -197,25 +203,62 @@ std::optional<std::string> ValidateOptions(const cxxopts::ParseResult& result) {
   }
 
   int kos = result["kernel_oversample"].as<int>();
-  if ((kos & (kos - 1)) != 0) {
-    return "Kernel oversampling factor must be a power of 2";
+  if (kos <= 0 || (kos & (kos - 1)) != 0) {
+    return "Kernel oversampling factor must be a positive power of 2";
   }
+  // ResetGcfElem assigns one thread per oversampled support pixel and
+  // supports at most a 32x32 footprint. Divide first to avoid integer overflow.
+  if (kos > 32 / support)
+    return "support * kernel_oversample must not exceed 32";
 
   int nbin = result["chan_nbin"].as<int>();
-  int nchan = result["channels"].as<int>();
-
-  if (nchan % nbin != 0) {
-    return "Number of channels must be an integral multiple of the binning "
-           "factor.";
-  }
-
   int nstreams = result["nstreams"].as<int>();
-
-  if (nstreams <= 0) {
-    return "The number of streams must be greater than 0";
+  if (nstreams <= 0 || nstreams > MAX_GULP_STREAMS) {
+    return "nstreams must be between 1 and "s + std::to_string(MAX_GULP_STREAMS);
+  }
+  int per_device_channels = channels;
+  try {
+    if (offline) {
+      per_device_channels =
+          OfflineChannelSlice(channels, ndevices, 0, nbin, nstreams).count;
+    } else {
+      CheckedChannelBins(channels, nbin);
+      if (channels % nstreams != 0)
+        return "Each GPU channel count must be divisible by nstreams";
+    }
+    if (offline)
+      OfflinePackedBytes(nts, per_device_channels, LWA_SV_NSTANDS, LWA_SV_NPOLS);
+  } catch (const std::exception& error) {
+    return error.what();
+  }
+  if (per_device_channels > MAX_CHANNELS_4090) {
+    return "Per-GPU input channels exceed the supported limit of "s +
+           std::to_string(MAX_CHANNELS_4090);
   }
 
-  if (result["elev_limit_deg"].as<float>() < 0) {
+  // cudaGetDeviceCount may fail without writing its output. Initialize once and
+  // check the result instead of reading the legacy GetNumGpus uninitialized int.
+  int available_gpus = 0;
+  if (cudaGetDeviceCount(&available_gpus) != cudaSuccess) available_gpus = 0;
+  if (ndevices > available_gpus) {
+    return "Requested "s + std::to_string(ndevices) + " GPUs but only "s +
+           std::to_string(available_gpus) + " available"s;
+  }
+  if (result.count("gpu_ids") > 0) {
+    auto gpu_ids = result["gpu_ids"].as<std::vector<int>>();
+    if (gpu_ids.size() != size_t(ndevices))
+      return "A GPU ID must be specified for each EPIC instance";
+    std::set<int> distinct;
+    for (int id : gpu_ids) {
+      if (id < 0 || id >= available_gpus)
+        return "GPU IDs must reference available non-negative devices";
+      if (!distinct.insert(id).second)
+        return "GPU IDs must be distinct";
+    }
+  }
+
+  const float elevation = result["elev_limit_deg"].as<float>();
+  if (!std::isfinite(elevation) || elevation < 0 || elevation > 90) {
     return "Elevation limit must be between 0 and 90 degrees";
   }
 
@@ -254,6 +297,13 @@ void InitInfoMetric(const cxxopts::ParseResult& result){
 //git_CommitSHA1()
   using sVec = typename std::vector<std::string>;
   using iVec = typename std::vector<int>;
+  iVec gpu_ids;
+  if (result.count("gpu_ids")) {
+    gpu_ids = result["gpu_ids"].as<iVec>();
+  } else {
+    for (int slot = 0; slot < result["ngpus"].as<int>(); ++slot)
+      gpu_ids.push_back(slot);
+  }
   PrometheusExporter::AddInfoLabels({
     {"F_engines", VJoin(result["addr"].as<sVec>())},
     {"ports",VJoin(result["port"].as<iVec>())},
@@ -269,7 +319,7 @@ void InitInfoMetric(const cxxopts::ParseResult& result){
     {"chan_nbin",std::to_string(result["chan_nbin"].as<int>())},
     {"nstreams",std::to_string(result["nstreams"].as<int>())},
     {"ngpus",std::to_string(result["ngpus"].as<int>())},
-    {"gpu_ids",VJoin(result["gpu_ids"].as<iVec>())},
+    {"gpu_ids",VJoin(gpu_ids)},
     {"elev_limit_deg",std::to_string(result["elev_limit_deg"].as<float>())},
     {"video_size",std::to_string(result["video_size"].as<int>())},
     {"stream_cmap",result["stream_cmap"].as<std::string>()},

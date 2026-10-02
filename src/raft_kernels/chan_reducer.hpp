@@ -31,6 +31,7 @@
 
 #include "../ex/buffer.hpp"
 #include "../ex/constants.h"
+#include "../ex/offline_config.hpp"
 #include "../ex/metrics.hpp"
 #include "../ex/py_funcs.hpp"
 #include "../ex/tensor.hpp"
@@ -82,9 +83,9 @@ class ChanReducerRft : public raft::kernel {
         m_xdim(p_xdim),
         m_ydim(p_ydim),
         m_in_nchan(p_in_nchan),
+        m_out_nchan(CheckedChannelBins(p_in_nchan, p_ncombine)),
         m_in_tensor(PSTensor<float>(m_in_nchan, m_xdim, m_ydim)),
-        m_out_tensor(
-            PSTensor<float>(size_t(p_in_nchan / p_ncombine), m_xdim, m_ydim)),
+        m_out_tensor(PSTensor<float>(m_out_nchan, m_xdim, m_ydim)),
         m_hc_chans(GetHealthCheckChans<LWA_SV>()) {
     input.addPort<_PldIn>("in_img");
     output.addPort<_PldOut>("out_img");
@@ -139,7 +140,7 @@ class ChanReducerRft : public raft::kernel {
     auto& out_meta = out_pld.get_mbuf()->GetMetadataRef();
 
     out_meta = in_pld.get_mbuf()->GetMetadataRef();
-    out_meta["nchan"] = (uint8_t)m_out_nchan;
+    out_meta["nchan"] = static_cast<int>(m_out_nchan);  // int，支持 1024 通道
     out_meta["chan_width"] = BANDWIDTH * m_ncombine;
 
     m_in_tensor.assign_data(in_pld.get_mbuf()->GetDataPtr());

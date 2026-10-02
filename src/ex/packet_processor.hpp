@@ -231,7 +231,7 @@ void PacketProcessor<chips_hdr_type, uint8_t, Copier, Order>::set_metadata(
   int nseqs = p_seq_end - p_seq_start;
   mref["nseqs"] = nseqs;
   mref["gulp_len_ms"] = (p_seq_end - p_seq_start) * SAMPLING_LEN_uS * 1e-3;
-  mref["nchan"] = p_hdr.nchan;
+  mref["nchan"] = static_cast<int>(p_hdr.nchan);  // int，与 Python 路径一致
   mref["chan0"] = int64_t(p_hdr.chan0);  // to meet alignment requirements
   mref["data_order"] = (Order == TIME_MAJOR ? "t_maj"s : "c_maj"s);
   mref["nbytes"] =

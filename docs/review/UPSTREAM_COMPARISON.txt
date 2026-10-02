@@ -1,0 +1,125 @@
+LWA_EPIC 上游核心算法对照（2026-10-02）
+只读源码审阅；未编译、未运行GPU、未修改仓库源码。报告文件是唯一写入。
+路径：/mnt/data_ssd/zdj/LWA_EPIC。
+说明：当前工作区由其他任务修复中，下文“本地”指本审计读取时的工作区初始改动；上游行号以 git show REF:PATH | nl -ba 为准，避免修复过程行号漂移。
+
+一、比较版本与结构
+1. 当前默认主线 origin/phoenix：44bb9b43cf8a13a39e572e1a721b5e9473faf63f。
+2. 离线分支 origin/aiyuan/offline：93aab8c88a756e0c0a3c145ff9e8980611e4d400；本地HEAD也此提交，初始改动均未提交。
+3. 历史 origin/main：0158349f246bd03d78df2f731a3acd21777b9a7a。
+4. main 是旧 Python/Bifrost 实现，核心文件 LWA_EPIC/LWA_EPIC.py；没有 src/ex/fft_dx.cuh 等C++文件，因此不能将其作为同文件diff或CUDA数值完全一致的标准。phoenix才是当前默认主线的CUDA架构。
+5. phoenix与offline这5个文件blob逐项相同：
+src/MOFF_cu_handler.cu = e461ace7fea6dc430bddcda93f5fb0426620e826
+src/ex/cu_helpers.cuh = d91697a39141f9386f8962e5d9c6b8f116cf35e5
+src/ex/fft_dx.cuh = 9ad350467f41b51473e9ba06a868ef515edd4103
+src/ex/gridder.cuh = 4de0dd4e4365e22413d466aef22297171b7ec68e
+src/ex/py_funcs.hpp = cb89aeb07d423ec783f4304bfd3ab98c3825bbdf
+offline的MOFF_correlator.hpp主要加日志/格式；DummyPktGen:75取消Get40msGulp注释而实际启用读盘；Python save_output:218注释daily_digest摄取。上述两分支没有不同的CUDA相关算法。
+
+二、上游数据排列：输入转置没有隐藏在读取之前
+phoenix/offline：
+- cu_helpers.cuh:110-119 GetFEngSample模板支持两布局：
+  CHAN_MAJOR地址=32或512输入宽度×(chan*nseq+seq)。
+  TIME_MAJOR地址=输入宽度×(seq*nchan+chan)。
+- fft_dx.cuh:125-127 BlockEpicImager默认Order=CHAN_MAJOR。
+- fft_dx.cuh:310-330 GetImagingKernel仅传FFT/support/accum类型，未选择Order，所以实际成像核频道优先。
+- packet_processor.hpp:160-171 UDP装配器支持两布局，在装配时依Order直接散写到目标布局；kernel_types.hpp正常实时类型使用CHAN_MAJOR（应跟随最终执行图确认）。
+- Python epic_utils.py:265-282 get_40ms_gulp从NPZ data.ravel().copy，不做time/channel转置。
+- py_funcs.hpp:215-248 Get40msGulp仅把Python展平复数逐个写CNib，未reshape/transpose。
+- dummy_packet_gen.hpp:100宣称data_order=t_maj；元注释data dims time,chan,stand,pol。
+- 当前本地epic_utils.py:455也仍data.ravel().copy；py_funcs.hpp:255-263也只pack；EPIC执行图src/raft_kernels/epic_executor.hpp:79-81直接Dummy→Correlator，没有输入转置节点；CorrelatorRft不根据data_order选择不同kernel。
+因此：离线路径的时间优先NPZ与频道优先GPU地址是继承的不一致，并非本地新改动；除非生成NPZ前就把数据物理存成频道优先且误标shape/meta，否则读取链本身无隐藏转置。应验证实际NPZ约定，而不能因发现某处transpose就取消这个问题。
+FFT内部TransposeTri（fft_dx:82）只转图像x/y轴；Python save_output:177的(3,0,2,1)只转输出产品/频道/图像轴；get_correction_grid:355的(0,2,1)只转校正图。这三者都不交换输入time/channel。
+若修复采用host先转CHAN_MAJOR，可以保持多stream输入段按频道连续复制；只改kernel为TIME_MAJOR时还必须重新检查ProcessGulp逐stream复制的连续字节切片与执行依赖，不能默认兼容。
+历史main：
+LWA_EPIC/LWA_EPIC.py:884-885明确(time,chan,stand,pol)，:1004-1016以相同shape直接拷GPU，Bifrost Romein按此shape处理；main不存在C++模板默认Order错配问题。
+
+三、上游FFT与输出缩放意图
+phoenix/offline：
+- fft_dx.cuh:68-89 Fft2D：第一维cuFFTDx逆变换，TransposeTri时乘固定1/64，第二维逆变换；保留转置后的输出布局。
+- 该1/64不是NumPy ifft2的完整1/N²归一化。源代码注释:80-81目的为防half溢出。
+- 历史提交 5c9f2226099d36edc152c452132fbc0c1f8d9540（2024-05-03）将1/2改1/4，提交说明防溢出；309a192ac17f0c279522aa8f37b10d61437dbdfd（2024-05-04）将1/4改1/64，说明更新单图归一化。
+- fft_dx.cuh:236-239所有XX/YY/U/V再乘row_size=N后积累；:275-278第一gulp赋值，后续gulp加，没有平均除nseq/ngulp。
+- PythonFITS标UNCALIB（phoenix epic_utils.py:133，初始本地:276），不可将其绝对幅度直接当已校准通量。
+- 两次ifft加一次转置的输出图像轴布局与NumPy直接ifft2不同，Pythoncorrection:355和FITS:177明确对此补转置。
+main：
+LWA_EPIC/LWA_EPIC.py:1055-1062调用BifrostFft(inverse=True)，未在repo源码给出同样1/64因子；FFT确切归一化还依赖其Bifrost版本，不应仅凭本repo断言其输出与NumPy或cuFFTDx幅度相同。
+main:1145-1163相关量时间累积求和，也没有按序列平均。
+结论：“CUDA应改为完整1/N²”并不能单靠上游规范成立；保持数值约定必须将FFT、乘N、autocorr与correction整体做参考验证。
+
+四、极化相关products：已发现继承的公式问题
+GPU压缩双极化布局：
+gridder.cuh:551-558先得到temp_data.x=(ReX,ImX)、temp_data.y=(ReY,ImY)，:575-578交换两个字段后成为RRII：
+pix.x=(ReX,ReY)，pix.y=(ImX,ImY)。
+这是cuFFTDx半精度两FFTs并行存储约定，fft_dx.cuh:92-102注释同样说明RRII。
+设a=ReX,b=ImX,c=ReY,d=ImY：
+- ComputeXX，cu_helpers.cuh:467-471：a²+b²，正确。
+- ComputeYY，:487-489：c²+d²，正确。
+- ComputeUU，:504-505：a*b+c*d，然而注释是Re(X*conj(Y))；数学正确公式a*c+b*d。因此这一公式与自己RRII约定不一致。
+- ComputeVV，:521-522：c*b-a*d，等于Im(X*conj(Y))，正确。
+本地仅为上述返回值增加float中转构造，未改UU公式；本地对应:480/498/516/534。
+已用微小Python复数代数验证x=1+2j,y=3+4j，XY*=11+2j，而继承UU公式得14，VV得2。此验证不包含GPU布局变换，源码RRII布局证据如上；建议加明确RRII单测，随后谨慎修公式。
+输出四个float实际为[XX,YY,候选ReXY*,ImXY*]，不是Stokes[I,Q,U,V]。函数命名UU/VV容易误导：即便修正UU，Stokes U/V还存在常见2倍/符号约定，要遵守产品定义。
+main使用不同且更明确的四个复products：LWA_EPIC.py:930-932标[xx,xy,yx,yy]，:1146表达式b(p/2)*conj(b(p%2))，不受上述UU公式影响。
+phoenix Python epic_utils.py:205-208与初始本地:347-350仍用FITS STOKES轴-5,-6,-7,-8（XX,YY,XY,YX），但GPU最后两plane是Re/ImXY拆分而非完整XY/YX复值；这是继承的输出语义/元数据缺口，不能称四个标准Stokes。main按复相关写出，是不同格式，不应混为一谈。
+
+五、自相关：上游已实际扣除，但开关和完整性有问题
+phoenix/offline：
+- gridder.cuh:662-679 AccumAutoCorrs累积每天线XX、YY、ReXY、ImXY。
+- fft_dx.cuh:217-220每序列都调用；:254-264在gulp结束对XX/YY的原点gridding做FFT并扣除，代码不受m_rm_autocorrs开关控制。
+- MOFF_correlator.hpp:206-208（phoenix）及:213-215（初始本地）仍告警remove unsupported，m_rm_autocorrs未作为GPU核参数。
+- gridder.cuh:561-563为自相关XX/YY用|phase|（sqrt of norm），不是功率校准应有的|phase|²；且使用单GCF scale，不是通用天线illumination相关核。phase1时前者数值相同，真实增益校准时不同。
+- gridder:562-563对自相关入grid还除N³；Fft2D再乘1/64；fft_dx:264扣abs(real)*N²；XX/YY以外不扣。代码有XY gridding分支(:566)，但BlockEpicImager未调用该扣除分支。
+- 当前本地fft_dx:264-268仅将half绝对值转float、scale在float先乘后转积累类型，解决构造歧义并变舍入顺序，算法缺口均继承。
+单天线、单位phase、support1/delta核、无half舍入理想化推导：电场FFT幅度V/64，主XX累积系数N/4096；自动相关支路输入P/N³、FFT再/64、扣乘N²，扣除系数1/(64N)。N64为所需的1/64，N128为所需1/256，即单天线纯自相关仍大量残留；这是静态符号证据，需要实际GPU/参考数值验证，不应把这段上游作为已验证正确的自相关算法。
+main显式remove_autocorrs=False默认（:808），只有True才做4products自相关（:1095/1138-1142），:1164-1195时间求和、原点gridding、ifft、所有products减去。该架构是算法意图参照，但也应验证其kernel/FFT缩放，不能直接搬代码。
+纠正上轮说法：“自相关不支持”只代表类告警，不能理解为kernel没有扣除；实际扣除始终执行且不完整。
+
+六、GCF与correction的算法及问题归因
+phoenix/offline：
+- MOFF_correlator.hpp:277-282按频率GetAEff产生sqrt(aeff)*10 decimeter纹理宽度，再ProlateSpheroidalToTex2D。
+- cu_helpers.cuh:280-346 ComputeGcfElements在每个天线/频道/像素做texture数值积分并把每天线kernel归一化sum1；界外像素贡献0。其频率位置/核支撑已考虑频道。
+- MOFF_correlator:306-314先更细support和delta/oversample计算，求平均kernel再生成correction；随后重建原support GCF给电场grid。
+- cu_helpers:359-385 ComputeAvgGriddingKernel对所有stands各cell atomicAdd，再除kernel总和。
+- py_funcs.hpp:302-305说明correction是每频道平均kernel的平方ifft。
+- Python epic_utils.py:330-377在M=N*oversample网格嵌入平均核，np.fft.ifft2，中心裁成N²，交换xy匹配GPU转置输出，|.|²后取倒数。
+- fft_dx:271-274所有积累products乘correction。它应是位置依赖的平均gridding illumination校正，而不是常数增益。
+继承问题：
+1. MOFF_cu_handler.cu:131未给extern shared antenna_sum动态共享内存；:151 cudaMalloc之后未置0即atomicAdd，这是phoenix/offline共同问题。本地补launch sharedbytes和cudaMemset是在修复这两个问题。
+2. 平均核对所有编译stands算，未根据有效phase、bad antennas、PAD有效性加权。原256LWA也存在masked antennas仍计平均的近似问题；本地16有6PAD后更显著。
+3. gridder.cuh:511/540读gcf_grid_elem的channel_idx=blockIdx.x，而fft_dx.cuh:167天线坐标/相位/correction用blockIdx.x+chan_offset。nstreams>1时后续stream重复第一段GCF。这也是两个上游相同，不是本地新改。
+4. Python get_correction_grid的两次np.fft.fftshift没有axes，连频道轴一起移；两次同长度频道shift对偶数nchan可抵消，对奇数未必恒等；属于上游继承的需验证边界。fix应明确axes=(1,2)，并保护结果兼容。
+本地回归：
+- 初始本地 epic_utils.py:558-561在归一化ifft2功率与float32 eps=2^-23比较。对于非负sum1核，最大功率<=1/M⁴；M64已有5.96e-8，M1283.73e-9，M2562.33e-10，均小于eps，因此整图倒数截成8388608。防NaN目的可理解，但毁掉空间correction。
+- 主审已读当前repo/build的corr_grid_arr.npz，shape=(128,64,64), min=max8388608，支持现存产物确实常数化；不可归咎上游，它们是np.reciprocal直接倒数。
+本地其他修改：
+- 纹理ceil且>=1，并取与原当前宽度max，避免小AEff变0，但也更改频率切换只增不减和CLI aeff的有效性。
+- 坏kernel改delta兜底和float中转类型是防坏数/编译的修改，不能替代物理校正验证。
+main ant_extent=1(:849)，phases kernel含电缆校准(:939-964)，没有同名平均GCF反卷积校正链；因此“照main恢复correction公式”不适用。
+
+七、上轮主要发现归类
+本地新回归/扩展未完成：
+A. 默认channels128→1024，而host output buffer保留旧默认，静态明确容量不足（初始types.hpp:85、MOFF_correlator:252/391、MOFF_cu_handler:314；详见前审计）。上游默认128和最大128没有触发1024复制尺寸。
+B. eps下限将correction常数化，见上。
+C. 新nseqs动态读取但MOFF序列长度仍来自CLI；时间<=100按40ms与GPU40us模型错配，是本地新增1s支持未贯通。
+D. nbytes已乘NPOLS又乘2，CNib每复数1byte，属于本地新增两倍元数据。
+E. center_freq回填当作chan0、25kHz却标1024 full250MHz、4stands默认mapping与16stands编译冲突，都本地新增。
+继承但本地扩大影响：
+F. 固定host output buffer设计、固定CLI nts、离线t_maj与GPU c_maj、无shape/capacity检查、4bit直接转换、固定seq_start/反复同NPZ、GCFstream offset、自相关相关量/缩放、UU公式。
+已在本地修复的继承问题：
+G. GCF shared allocation、atomicAdd前清0、旧NPZ meta complex_count而C++又/2只复制一半（上游Python:277与py_funcs:239；本地2*size修正）。
+上轮需要纠正/降级：
+H. m_nchan_in不是上游未初始化。phoenix/offline MOFFCorrelator派生成员是注释，但基类src/ex/MOFF_cu_handler.h:122有int m_nchan_in{0}。本地恢复派生成员遮蔽基类，两成员分别由ResetImagingConfig/ResetData更新，是冗余状态，不可描述为必需修复。
+I. block sync条件分支仅静态可疑，未进入循环线程会到kernel结尾退出；不能判定必然死锁。需要compute-sanitizer synccheck/GPU验证，本任务没有运行。
+J. 不能因main历史实现有Time-major就假设新CUDA自动处理，源代码证据显示离线未转置；也不能因FFT/保存转置就当输入已转。
+K. 本地数值保护不等于FFT/products改为float精度，ComputeXX等表达式还是half算完才转float。
+L. PNG清坏值不等于FITS也清理（初始localPython:323/359/362）。
+M. “autocorr unsupported”不等于不会扣自相关；实际始终扣部分项，见第五节。
+
+八、修复顺序建议（不代表本子任务已修改）
+1. 先安全/契约：host buffer尺寸、NPZ容量与stands/pols/nts校验、明确物理sample interval与真实channel frequencies、输入转为统一CHAN_MAJOR。
+2. correction保留空间变化，以相对阈值/合适dtype和有限检查代替绝对float32eps；先CPU参考覆盖delta/非均匀kernel、64/128、oversample1/2与多频道。
+3. 修stream GCF索引，检查图像xy转置与频道axes。
+4. 先建立RRII复数参考，再修UU；明确四plane格式与FITS元数据。
+5. autocorr用显式开关和完整数学参考验证其标定/核/缩放后再重写，不把上游直接当正确。不同GPU/half准确度可能需容差。
+6. 保留最终已确认的数值约定到报告，不盲目将本地恢复为phoenix或main。

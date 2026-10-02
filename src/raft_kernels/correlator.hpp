@@ -103,7 +103,7 @@ class CorrelatorRft : public raft::kernel {
     for (auto it = gulp_metadata.begin(); it != gulp_metadata.end(); ++it) {
       VLOG(3) << "Key: " << it->first;
     }
-    auto nchan = std::get<uint8_t>(gulp_metadata["nchan"]);
+    auto nchan = std::get<int>(gulp_metadata["nchan"]);
     auto chan0 = std::get<int64_t>(gulp_metadata["chan0"]);
 
     VLOG(2) << "nchan: " << int(nchan) << " chan0: " << chan0;

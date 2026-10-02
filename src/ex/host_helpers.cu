@@ -20,9 +20,8 @@ cuMUnlock(T* ptr)
 int
 GetNumGpus()
 {
-    int n_devices;
-    cudaGetDeviceCount(&n_devices);
-
+    int n_devices = 0;
+    cuda_check_err(cudaGetDeviceCount(&n_devices));
     return n_devices;
 }
 

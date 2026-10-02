@@ -1,62 +1,62 @@
-# What is EPIC?
-![](https://github.com/epic-astronomy/LWA_EPIC/raw/main/image_compare.gif)
+# LWA EPIC: L-band offline imaging work
 
-A direct imaging correlator for radio interferometer arrays. Instead of cross-correlating voltages streams from all antenna to form visibilities, voltages can be gridded and Fourier Transformed directly into the image domain. A Discrete Fourier Transform (DFT) can also be implemented to skip the gridding step.
-However, as seen in the gif above, the FFT and DFT implementations currently have different normalizations.
+This development branch preserves the local L-band adaptation of
+[LWA_EPIC](https://github.com/epic-astronomy/LWA_EPIC), repairs its MOFF execution
+path, and adds a native FP32 CUDA/cuBLAS FX imager for small arrays.
 
-The process creates all sky images in real time with millisecond time resolution. High time resolution is vital in the identification and classification of radio transients, FRBs, Pulsar timing, and Gravitational Wave follow-ups.
+The starting point is `aiyuan/offline` at
+`93aab8c88a756e0c0a3c145ff9e8980611e4d400`. The upstream default CUDA branch is
+`phoenix` (`44bb9b43cf8a13a39e572e1a721b5e9473faf63f`); historical `main` is
+`0158349f246bd03d78df2f731a3acd21777b9a7a`. This branch does not merge those
+different implementations or modify the upstream baselines.
 
-Images can easily be combined to form deeper integrations as well when lower sensitivity is desired for weaker signals.
+## Start here
 
-This repository is an implementation of the EPIC (E-field Parallel Imaging Correlator) specifically for use with the Long Wavelength Array (LWA). In this new version of the code, the GPU implemetation is optimized to produce images completely using on-chip memory for all polarizations. See [EPIC Memo #9](https://github.com/epic-astronomy/Memos/blob/temp/dx_optimizations/PDFs/009_EPIC_Code_Optimizations.md) for details on the new optimizations.
+- [Current repair status and remaining scientific gates](docs/CORE_REPAIR_STATUS.md)
+- [Dual RTX4090 repairs, tests, and MOFF entrypoint](docs/BATCH2_GPU_REPAIR.md)
+- [Native FX build, data contract, and two-GPU NPZ runner](docs/FX_BACKEND.md)
+- [Algorithm choice, original papers, and benchmark limits](docs/LBAND_ALGORITHM_CHOICE.md)
+- [Original upstream README and build instructions](docs/README.md)
 
-For a generalized implementation of EPIC please see [our EPIC repo](https://github.com/epic-astronomy/EPIC).
+The FX path requires explicit physical antenna positions, RF frequencies,
+direction vectors, IQ/phase conventions and voltage gains. It produces engineering
+NPZ products. The legacy MOFF path requires known positive UTC and signed CNib
+voltages; `scripts/run_moff_offline.sh` selects a separately built executable.
+No binary, observation data or generated scientific result is included in Git.
+Workstation executable paths in the detailed notes describe the validation host;
+build the code and configure those paths on another machine.
 
+## Verification
 
-# Build Instructions
-Download the source code with all the dependencies. 
+On the validation host, the combined CPU and two-RTX4090 suite passes 46 tests.
+The actual MOFF CUDA regression passes 22 cases repeated three times; tested
+memcheck/racecheck/synccheck paths report no errors. Single-card, multiple-stream
+and dual-card synthetic FITS reconstruction is identical.
+
 ```bash
-git clone -b phoenix --recurse-submodules -j5 https://github.com/epic-astronomy/LWA_EPIC.git
+bash src/fx/build.sh
+EPIC_FX_TEST_GPU=1 EPIC_FX_TEST_TWO_GPU=1 \
+  python3 -m unittest discover -s tests -v
 ```
 
-It is recommended to build and run EPIC in a separate conda environment. Use the `conda_env.yml` file to create a new conda enviroment and install all the necessary packages. Change the last line in this file to the desired install location and exceute the following command.
-```bash
-conda create -n epic python=3.10 --file=conda_env.yml
-```
-Additionally, download and extract [NVIDIA MathDx](https://developer.nvidia.com/mathdx#:~:text=wget%20https%3A//developer.download.nvidia.com/compute/mathdx/redist/mathdx/linux%2Dx86_64/nvidia%2Dmathdx%2D22.11.0%2DLinux.tar.gz) package to the `src/extern` folder. 
+GPU tests require two available CUDA devices. Without opt-in, GPU tests are
+explicitly skipped; see `tests/gpu/README.md` for the production-kernel tests.
+These results do not establish real-observation calibration, full-bandwidth
+throughput or scientific readiness. Older experiment scripts and progress notes
+are retained as history; use the current repair status for acceptance criteria.
 
-Within this environment, 
+## Existing dependency build fixes
 
-Run the following shell commands to build EPIC
-```bash
-cd LWA_EPIC
-mkdir build && cd build
-cmake ..
-make
-```
+The workstation has two small uncommitted header fixes inside nested submodules.
+Their original submodule commits are retained; the fixes are distributed here as
+patches instead of references to unpublished dependency commits. After recursive
+submodule initialization, apply them once when building the legacy MOFF target:
 
-To create a debug build:
 ```bash
-cmake -DCMAKE_BUILD_TYPE=Debug ..
-make
+git -C src/extern/RaftLib apply --check ../../../patches/raftlib-cstdint.patch
+git -C src/extern/RaftLib apply ../../../patches/raftlib-cstdint.patch
+git -C src/extern/RaftLib/git-dep/shm apply --check ../../../../../patches/shm-cstdint.patch
+git -C src/extern/RaftLib/git-dep/shm apply ../../../../../patches/shm-cstdint.patch
 ```
 
-Memory errors can be detected using the following valgrind command
-```bash
-valgrind --leak-check=full \
-         --show-leak-kinds=all \
-         --track-origins=yes  \
-         --verbose \
-         --log-file=valgrind-out.txt \
-          ./epic++
-```
-
-This creates an executable called `epic++`. If it needs to executed from a different directory please also copy all the python files from the build directory or ensure they are visible to the embedded python interpreter.
-
-## Instructions for running with offline data
-The following command runs the epic imager on offline data. It is assumed that epic is executed on on NVIDIA RTX 4090, which contains 128 SMs.
-```bash
-./epic++ --offline --out_dir offline_outputs --disable_metrics --imagesize 128 --channels 128 --chan_nbin 1 --seq_accum 40 --nts 1000 --imageres 1.056 --accum_16bit --nstreams 8 --support 5 --aeff 25 --kernel_oversample 4 --ngpus 1 --gpu_ids=0
-```
-
-This command reads a file npz file `data/40ms_128chan_600offset_gulp_c64_virtransit.npz` which provides a single `40 ms` gulp and writes the output image to `offline_outputs/EPIC_79905306897.629_44.775MHz.fits`. Additionally, a quick look png file is also saved to the `offline_outputs` folder.
+The native FX backend is independent of those legacy Raft dependencies.

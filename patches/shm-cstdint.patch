@@ -1,0 +1,12 @@
+diff --git a/include/shm b/include/shm
+index 8ed0015..8cd7f69 100644
+--- a/include/shm
++++ b/include/shm
+@@ -21,6 +21,7 @@
+ #define _SHM_HPP_  1
+ 
+ #include <cstdlib>
++#include <cstdint>
+ #include <utility>
+ #include <exception>
+ #include <string>

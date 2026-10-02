@@ -1,0 +1,32 @@
+# 9178 Crab full EPIC layout.
+# The first ten stands are physical L-band array antennas.
+# PAD01-PAD06 are zero-input placeholders so EPIC keeps its 32-input layout.
+
+station:
+  name: "LBAND-9178-CRAB-FULL16"
+  nstands: 16
+  npols: 2
+
+antenna_to_epic_index:
+  北4: 0
+  北3: 1
+  东4: 2
+  东3: 3
+  东5: 4
+  东6: 5
+  东9: 6
+  东10: 7
+  东7: 8
+  东8: 9
+  PAD01: 10
+  PAD02: 11
+  PAD03: 12
+  PAD04: 13
+  PAD05: 14
+  PAD06: 15
+
+observation:
+  source_name: "Crab"
+  center_freq_mhz: 1355
+  bandwidth_mhz: 250
+  data_dir: "/mnt/data_ssd/zdj/data/9178"

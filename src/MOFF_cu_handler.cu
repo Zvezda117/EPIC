@@ -29,6 +29,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <iostream>
+#include <stdexcept>
 #include <nvml.h>
 #include <glog/logging.h>
 
@@ -73,8 +74,8 @@ MOFFCuHandler::ResetGcfTex(int p_gcf_tex_dim, float* p_gcf_2D_ptr)
 {
     cuda_check_err(cudaSetDevice(m_device_id));
     if (is_gcf_tex_set) {
-        cuda_check_err(cudaFreeArray(m_gcf_tex_arr));
         cuda_check_err(cudaDestroyTextureObject(m_gcf_tex));
+        cuda_check_err(cudaFreeArray(m_gcf_tex_arr));
     }
 
     cudaMallocArray(&m_gcf_tex_arr, &m_gcf_chan_desc, p_gcf_tex_dim, p_gcf_tex_dim);
@@ -114,6 +115,9 @@ MOFFCuHandler::CreateGulpCuStreams()
 }
 
 void MOFFCuHandler::ResetGcfElem(int p_nchan, int p_support, int p_chan0, float p_delta, int p_grid_size){
+    if (p_nchan <= 0 || p_support <= 0 || p_support > 32) {
+        throw std::invalid_argument("GCF channels must be positive and the oversampled support must be in [1, 32]");
+    }
     cuda_check_err(cudaSetDevice(m_device_id));
     if(is_m_gcf_elem_set){
         cuda_check_err(cudaFree(m_gcf_elem));
@@ -128,7 +132,10 @@ void MOFFCuHandler::ResetGcfElem(int p_nchan, int p_support, int p_chan0, float 
     block_size *= nelements_gcf;
 
     VLOG(2)<<"Pre-computing GCF elements\n"<<p_support<<" "<<block_size<<" "<<nelements_gcf;
-    ComputeGcfElements<<<p_nchan, block_size>>>(m_gcf_elem, m_antpos_cu, p_chan0, p_delta, m_gcf_tex,p_grid_size, (p_support), LWA_SV_NSTANDS);
+    ComputeGcfElements<<<p_nchan, block_size,
+                         LWA_SV_NSTANDS * sizeof(float)>>>(
+        m_gcf_elem, m_antpos_cu, p_chan0, p_delta, m_gcf_tex, p_grid_size,
+        (p_support), LWA_SV_NSTANDS);
     VLOG(2)<<"Done\n";
 
     cudaDeviceSynchronize();
@@ -147,8 +154,7 @@ void MOFFCuHandler::GetCorrectionKernel(float* p_out_kernel, int p_support, int 
     }
     cuda_check_err(cudaMalloc(&m_correction_kernel_d, nbytes));
     is_correction_kernel_set = true;
-
-    
+    cuda_check_err(cudaMemset(m_correction_kernel_d, 0, nbytes));
 
     ComputeAvgGriddingKernel<<<p_nchan, LWA_SV_NSTANDS>>>(m_gcf_elem, m_correction_kernel_d ,p_nchan, p_support);
 
@@ -156,6 +162,18 @@ void MOFFCuHandler::GetCorrectionKernel(float* p_out_kernel, int p_support, int 
 
     cudaDeviceSynchronize();
     cuda_check_err(cudaPeekAtLastError());
+}
+
+void MOFFCuHandler::ResetAutoCorrPower(int nchan, int grid_size, int support) {
+    cuda_check_err(cudaSetDevice(m_device_id));
+    if (m_auto_power_d) cuda_check_err(cudaFree(m_auto_power_d));
+    const size_t count = size_t(nchan) * LWA_SV_NSTANDS * grid_size * grid_size;
+    cuda_check_err(cudaMalloc(&m_auto_power_d, count * sizeof(float)));
+    const dim3 blocks((grid_size * grid_size + 255) / 256, nchan * LWA_SV_NSTANDS);
+    ComputeAutoCorrPower<<<blocks, 256>>>(m_gcf_elem, m_antpos_cu, m_auto_power_d,
+                                        grid_size, support, LWA_SV_NSTANDS);
+    cuda_check_err(cudaGetLastError());
+    cuda_check_err(cudaDeviceSynchronize());
 }
 //void MOFFCuHandler::SetCorrectionGrid(float* corr_grid);
 
@@ -282,20 +300,23 @@ MOFFCuHandler::ProcessGulp(uint8_t* p_data_ptr, float* p_out_ptr, bool p_first, 
     VLOG(2)<<"FEng bytes per stream: "<<m_nbytes_f_eng_per_stream<<". OutImg bytes per stream: "<<m_nbytes_out_img_per_stream<<". Chan per stream: "<<m_nchan_per_stream<<". NStreams: "<<m_nstreams<<"\n";
     VLOG(2)<<"Nseq per gulp: "<<m_nseq_per_gulp<<"\n";
     for (int i = 0; i < m_nstreams; ++i) {
-        int f_eng_dat_offset = i * m_nbytes_f_eng_per_stream;
+        // Channel-major voltage slices must follow the channels computed by
+        // this stream, not nchan_in/nstreams when only a subset is imaged.
+        const size_t input_bytes = size_t(m_nchan_per_stream) * m_nseq_per_gulp * LWA_SV_INP_PER_CHAN;
+        const size_t f_eng_dat_offset = size_t(i) * input_bytes;
         int output_img_offset = i * m_nbytes_out_img_per_stream/sizeof(float);
         auto stream_i = *(m_gulp_custreams.get() + i);
         int chan_offset = i * m_nchan_per_stream;
 
         void* args[] = {
-            &m_f_eng_cu, &m_antpos_cu, &m_phases_cu, &m_nseq_per_gulp, &m_nchan_in, &m_gcf_tex, &m_output_cu, &chan_offset, &p_first, &m_gcf_elem, &m_correction_grid_d
+            &m_f_eng_cu, &m_antpos_cu, &m_phases_cu, &m_nseq_per_gulp, &m_nchan_in, &m_gcf_tex, &m_output_cu, &chan_offset, &p_first, &m_gcf_elem, &m_correction_grid_d, &m_remove_autocorr, &m_auto_power_d
         };
 
         cuda_check_err(
           cudaMemcpyAsync(
             (void*)(m_f_eng_cu + f_eng_dat_offset),
             (void*)(p_data_ptr + f_eng_dat_offset),
-            m_nbytes_f_eng_per_stream,
+            input_bytes,
             cudaMemcpyHostToDevice,
             stream_i));
         VLOG(2)<<"Launching the kernel\n";
@@ -313,7 +334,9 @@ MOFFCuHandler::ProcessGulp(uint8_t* p_data_ptr, float* p_out_ptr, bool p_first, 
         }
     }
 
-    if (p_last) {
+    // The input payload can be released as soon as this method returns.
+    // Wait for every H2D consumer even when this is not the final gulp.
+    {
         VLOG(2)<<"Syncing the kernels\n";
         for (int i = 0; i < m_nstreams; ++i) {
             cuda_check_err(cudaStreamSynchronize(*(m_gulp_custreams.get() + i)));
@@ -370,5 +393,13 @@ MOFFCuHandler::~MOFFCuHandler()
 
     if(is_f_eng_cu_allocated){
         cudaFree(m_f_eng_cu);
+    }
+    if (m_auto_power_d) cudaFree(m_auto_power_d);
+    if (is_gcf_tex_set) {
+        cudaDestroyTextureObject(m_gcf_tex);
+        cudaFreeArray(m_gcf_tex_arr);
+    }
+    if (m_gulp_custreams) {
+        for (int i = 0; i < m_nstreams; ++i) cudaStreamDestroy(m_gulp_custreams[i]);
     }
 }

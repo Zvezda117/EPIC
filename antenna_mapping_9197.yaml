@@ -1,0 +1,58 @@
+# 天线接线映射配置 - 9197数据集
+# 简化配置：每个文件只有1个极化，无需解交织
+
+station:
+  name: "LBAND-9197-4ANT"
+  nstands: 4     # 只有4个天线
+  npols: 1       # 每个文件只有1个极化
+
+# 文件到天线的映射（非常简单！）
+terminal_mapping:
+  # H22 → 北3号天线
+  HBaseband2Spec2:
+    antenna: "北3"
+    polarization: "unknown"  # 用户未指定H还是V
+    terminal_name: "H22"
+    note: "单极化，无需解交织"
+    
+  # V00 → 北4号天线
+  VBaseband0Spec0:
+    antenna: "北4"
+    polarization: "unknown"
+    terminal_name: "V00"
+    note: "单极化，无需解交织"
+    
+  # V11 → 北5号天线
+  VBaseband1Spec1:
+    antenna: "北5"
+    polarization: "unknown"
+    terminal_name: "V11"
+    note: "单极化，无需解交织"
+    
+  # V22 → 北6号天线
+  VBaseband2Spec2:
+    antenna: "北6"
+    polarization: "unknown"
+    terminal_name: "V22"
+    note: "单极化，无需解交织"
+
+# 天线索引
+antenna_to_epic_index:
+  "北3": 0
+  "北4": 1
+  "北5": 2
+  "北6": 3
+
+# 观测参数
+observation:
+  center_freq_mhz: 1355
+  bandwidth_mhz: 250
+  source_name: "9197"
+  data_dir: "/mnt/DATA/存储阵列/9197_Base2_ADC16_26-01-18_19-16-51/"
+  nfiles: 137  # 每个天线137个时间序列文件
+
+# 数据格式（重要！）
+data_format:
+  channels_per_file: 1  # 每个文件只有1个通道！
+  need_deinterleave: false  # 不需要解交织
+  data_type: "complex_int8"  # QI拼接，int8

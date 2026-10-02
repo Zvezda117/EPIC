@@ -1,0 +1,32 @@
+{
+  "kind": "synthetic_dualpol_new_API_not_observation",
+  "device": 1,
+  "T": 1000,
+  "C": 128,
+  "physical_slots": 16,
+  "active_antennas": 10,
+  "active_H": 5,
+  "active_V": 7,
+  "P": 4096,
+  "precision": "FP32_PEDANTIC_NO_TF32",
+  "remove_autocorr": false,
+  "setup_ms": 413.27112074941397,
+  "warmup": 1,
+  "repeats": 5,
+  "image_wall_ms": [
+    16.75580907613039,
+    20.328463986516,
+    15.90075483545661,
+    15.966140665113926,
+    16.013839282095432
+  ],
+  "image_wall_median_ms": 16.013839282095432,
+  "timing_includes": "Python/native validation + packing/gains + H2D + covariance/imaging + D2H + output finite check",
+  "oracle_channels": [
+    0,
+    127
+  ],
+  "oracle_pixels_per_channel": 16,
+  "oracle_max_abs": 4.3287881084097535e-06,
+  "oracle_max_scaled": 2.870102749335111e-07
+}

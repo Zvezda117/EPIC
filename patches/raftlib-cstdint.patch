@@ -1,0 +1,13 @@
+diff --git a/raftinc/alloc_defs.hpp b/raftinc/alloc_defs.hpp
+index 1623573..84da4e4 100644
+--- a/raftinc/alloc_defs.hpp
++++ b/raftinc/alloc_defs.hpp
+@@ -24,6 +24,8 @@
+ #ifndef RAFTALLOC_DEFS_HPP
+ #define RAFTALLOC_DEFS_HPP  1
+ 
++#include <cstdint>
++
+ enum memory_type : std::uint8_t { heap, shm };
+ 
+ #endif /* END RAFTALLOC_DEFS_HPP */

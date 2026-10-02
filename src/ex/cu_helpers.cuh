@@ -307,12 +307,16 @@ __global__ void ComputeGcfElements(float* out, float* antpos, int chan0,
   float dist_scale =
       float(SOL) / float((channel_idx + chan0) * BANDWIDTH) * lmbda_scale * 10.; //decimeters
 
-  for (int ant = grp_rank; ant < nants; ant += grp_size) {
+  // Every thread participates in the same rounds/barriers, including groups
+  // without an antenna in the final round (e.g. 16 antennas / 10 groups).
+  for (int first = 0; first < nants; first += grp_size) {
+    const int ant = first + grp_rank;
+    const bool active = ant < nants;
     int dy = half_support - (grp_thread_rank) / (support);
     int dx = (grp_thread_rank) % (support)-half_support;
 
-    float antx = antpos_chan[ant].x;
-    float anty = antpos_chan[ant].y;
+    float antx = active ? antpos_chan[ant].x : 0.0f;
+    float anty = active ? antpos_chan[ant].y : 0.0f;
 
     // antx=int(antx)+0.5;
     // anty=int(anty)+0.5;
@@ -325,25 +329,53 @@ __global__ void ComputeGcfElements(float* out, float* antpos, int chan0,
       is_pix_valid = false;
     }
 
-    float integral = is_pix_valid
+    float integral = active && is_pix_valid
                          ? GcfPixelIntegral(gcf_tex, (xpix - antx),
                                               (ypix - anty), dist_scale)
                          : 0;
 
-    atomicAdd(&antenna_sum[ant], integral);
+    if (active) atomicAdd(&antenna_sum[ant], integral);
     tb.sync();
 
-    float norm = antenna_sum[ant] != 0 ? 1.f / antenna_sum[ant] : 1.0;
+    float norm = active && antenna_sum[ant] != 0 ? 1.f / antenna_sum[ant] : 1.0;
     integral *= norm;
     // if(blockIdx.x==9 && threadIdx.x<49 && ant==0){
     //     printf("%d %d %f\n",dx, dy,  integral);
     // }
 
-    out[channel_idx * nants * nelements + ant * nelements + grp_thread_rank] =
-        integral;
+    if (active) out[channel_idx * nants * nelements + ant * nelements + grp_thread_rank] = integral;
 
     tb.sync();
   }
+}
+
+// Squared Fourier response of each voltage-gridding footprint. The CUDA
+// spatial FFT leaves axes transposed: output row is the input-x frequency.
+// The response excludes gains, voltages and the 1/64 FFT scale, so it can be
+// reused across all gulps until the gridding geometry changes.
+__global__ void ComputeAutoCorrPower(const float* grid_elems,
+                                     const float* antpos, float* out,
+                                     int grid_size, int support, int nants) {
+  const int pixel = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pixel >= grid_size * grid_size) return;
+  const int ant = blockIdx.y % nants;
+  const int chan = blockIdx.y / nants;
+  const int elems = support * support;
+  const float3 pos = reinterpret_cast<const float3*>(antpos)[chan * nants + ant];
+  const int kx = pixel / grid_size, ky = pixel % grid_size;
+  float re = 0.0f, im = 0.0f;
+  for (int e = 0; e < elems; ++e) {
+    const int x = int(pos.x + e % support - support / 2);
+    const int y = int(pos.y + support / 2 - e / support);
+    if (x < 0 || y < 0 || x >= grid_size || y >= grid_size) continue;
+    float sn, cs;
+    // Reduce integer cycles before sincos to avoid large-angle roundoff.
+    sincosf(2.0f * float(PI) * float((kx * x + ky * y) % grid_size) / grid_size, &sn, &cs);
+    const float w = grid_elems[(chan * nants + ant) * elems + e];
+    re += w * cs;
+    im += w * sn;
+  }
+  out[(chan * nants + ant) * grid_size * grid_size + pixel] = re * re + im * im;
 }
 
 /**
@@ -379,8 +411,17 @@ __global__ void ComputeAvgGriddingKernel(float* grid_elems,
       sum += out_kernel[blockIdx.x * nelems_per_ant + i];
     }
 
-    for (int i = 0; i < nelems_per_ant; ++i) {
-      out_kernel[blockIdx.x * nelems_per_ant + i] /= sum;
+    if (!(sum > 0.0f) || !isfinite(sum)) {
+      for (int i = 0; i < nelems_per_ant; ++i) {
+        out_kernel[blockIdx.x * nelems_per_ant + i] = 0.0f;
+      }
+      out_kernel[blockIdx.x * nelems_per_ant + nelems_per_ant / 2] = 1.0f;
+    } else {
+      for (int i = 0; i < nelems_per_ant; ++i) {
+        float val = out_kernel[blockIdx.x * nelems_per_ant + i] / sum;
+        out_kernel[blockIdx.x * nelems_per_ant + i] =
+            isfinite(val) ? val : 0.0f;
+      }
     }
   }
 }
@@ -468,7 +509,8 @@ inline __host__ __device__ T
 ComputeXX(typename FFT::value_type
                pix) {  // half precision intrinsics reduce the performance here
   // return T(__hfma(pix.x.x, pix.x.x, pix.y.x * pix.y.x));
-  return static_cast<T>(pix.x.x * pix.x.x + pix.y.x * pix.y.x);
+  // Promote before multiplying: avoid half overflow and preserve RRII products.
+  return static_cast<T>(static_cast<float>(float(pix.x.x) * float(pix.x.x) + float(pix.y.x) * float(pix.y.x)));
 }
 
 /**
@@ -485,7 +527,8 @@ template <
         std::is_same<__half2, typename FFT::output_type::value_type>::value,
         bool> = true>
 inline __host__ __device__ T ComputeYY(typename FFT::value_type pix) {
-  return static_cast<T>(pix.x.y * pix.x.y + pix.y.y * pix.y.y);
+  // Promote before multiplying: avoid half overflow and preserve RRII products.
+  return static_cast<T>(static_cast<float>(float(pix.x.y) * float(pix.x.y) + float(pix.y.y) * float(pix.y.y)));
 }
 
 /**
@@ -502,7 +545,8 @@ template <
         std::is_same<__half2, typename FFT::output_type::value_type>::value,
         bool> = true>
 inline __host__ __device__ T ComputeUU(typename FFT::value_type pix) {
-  return static_cast<T>(pix.x.x * pix.y.x + pix.x.y * pix.y.y);
+  // Promote before multiplying: avoid half overflow and preserve RRII products.
+  return static_cast<T>(static_cast<float>(float(pix.x.x) * float(pix.x.y) + float(pix.y.x) * float(pix.y.y)));
 }
 
 /**
@@ -519,7 +563,8 @@ template <
         std::is_same<__half2, typename FFT::output_type::value_type>::value,
         bool> = true>
 inline __host__ __device__ T ComputeVV(typename FFT::value_type pix) {
-  return static_cast<T>(pix.x.y * pix.y.x - pix.x.x * pix.y.y);
+  // Promote before multiplying: avoid half overflow and preserve RRII products.
+  return static_cast<T>(static_cast<float>(float(pix.x.y) * float(pix.y.x) - float(pix.x.x) * float(pix.y.y)));
 }
 
 #endif  // SRC_EX_CU_HELPERS_CUH_

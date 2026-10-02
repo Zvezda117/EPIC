@@ -29,9 +29,11 @@
 #include <raft>
 #include <raftio>
 #include <string>
+#include <utility>
 
 #include "../ex/buffer.hpp"
 #include "../ex/constants.h"
+#include "../ex/offline_config.hpp"
 #include "../ex/py_funcs.hpp"
 #include "../ex/types.hpp"
 
@@ -39,29 +41,34 @@ template <class Payload, class BufferMngr>
 class DummyPktGen : public raft::kernel {
  private:
   size_t m_n_pkts{3};
-  const int m_ngulps{20};
+  int m_expected_nseqs{1000};
+  const int m_ngulps{2};
   const int m_ngulps_per_seq{1000};
-  const int m_nchan_in{128};
-  const int m_chan0{1128 + 600};  // 1128+600
-  uint64_t m_time_from_unix_epoch_s{0};
+  // 从 Python gulp 读取 nchan/nseqs/chan0，支持 1024 通道等；仅无 Python 时用默认
+  const int m_nchan_default{128};
+  const int64_t m_chan0_default{1128 + 600};
+  int m_channel_start{0};
+  int m_channel_count{128};
+  std::string m_input_path;
   uint64_t m_time_tag0{0};
   std::unique_ptr<BufferMngr> m_buf_mngr{nullptr};
 
  public:
-  DummyPktGen(size_t p_n_pkts = 1, std::string utcstart = "2023_06_19T00_00_00")
-      : raft::kernel(), m_n_pkts(p_n_pkts) {
+  DummyPktGen(size_t p_n_pkts = 1, std::string utcstart = "2023_06_19T00_00_00",
+              int expected_nseqs = 1000, int channel_start = 0,
+              int channel_count = 128, std::string input_path = "")
+      : raft::kernel(), m_n_pkts(p_n_pkts), m_expected_nseqs(expected_nseqs),
+        m_channel_start(channel_start), m_channel_count(channel_count),
+        m_input_path(std::move(input_path)) {
     VLOG(3) << "Dummy pkt constructor";
+    if (channel_start < 0) throw std::invalid_argument("Channel start must be non-negative");
     m_buf_mngr = std::make_unique<BufferMngr>(
-        m_ngulps, m_ngulps_per_seq * SINGLE_SEQ_SIZE);
+        m_ngulps, OfflinePackedBytes(expected_nseqs, channel_count,
+                                    LWA_SV_NSTANDS, LWA_SV_NPOLS));
     output.addPort<Payload>("gulp");
-
-    if (utcstart == "") {
-      m_time_from_unix_epoch_s = GetAdpTimeFromUnixEpoch();
-    } else {
-      VLOG(3) << "Using provided utcstart: " << utcstart;
-      m_time_from_unix_epoch_s = GetTimeFromUnixEpoch(utcstart);
-    }
-    m_time_tag0 = m_time_from_unix_epoch_s * FS;
+    // Preserve the legacy constructor signature. Only NPZ metadata provides
+    // an observation timestamp; no station query or invented UTC is used.
+    (void)utcstart;
   }
 
   raft::kstatus run() override {
@@ -72,13 +79,22 @@ class DummyPktGen : public raft::kernel {
       LOG_IF(FATAL, !static_cast<bool>(pld)) << "Empty buffer in packet gen";
 
       auto start = std::chrono::high_resolution_clock::now();
-      Get40msGulp(pld.get_mbuf()->GetDataPtr());
+      int nseqs = m_ngulps_per_seq;
+      int nchan_from_file = m_nchan_default;
+      int64_t chan0_from_file = m_chan0_default;
+      double unix_start = 0;
+      Get40msGulp(pld.get_mbuf()->GetDataPtr(), pld.get_mbuf()->buf_size(),
+                  m_expected_nseqs, &nseqs, &nchan_from_file,
+                  &chan0_from_file, m_channel_start, m_channel_count,
+                  m_input_path, &unix_start);
+      m_time_tag0 = OfflineTimeTag(unix_start, FS);
+      VLOG(2) << "dummy_packet_gen: after Get40msGulp, nchan_from_file=" << nchan_from_file << " nseqs=" << nseqs;
       VLOG(3) << "Gulp gen duration: "
               << std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::high_resolution_clock::now() - start)
                      .count();
-      VLOG(3) << "Gulp id: " << i;
-      std::this_thread::sleep_for(std::chrono::milliseconds(40));
+      VLOG(3) << "Gulp id: " << i << " nchan: " << nchan_from_file
+              << " nseqs: " << nseqs;
 
       VLOG(3)
           << "Sending gulp at: "
@@ -87,19 +103,17 @@ class DummyPktGen : public raft::kernel {
                  .count();
 
       auto& mref = pld.get_mbuf()->GetMetadataRef();
-      uint64_t seq_start = 329008696996015680;
+      uint64_t seq_start = 0;
       mref["seq_start"] = seq_start;
-      mref["time_tag"] =
-          m_time_tag0 + std::get<uint64_t>(mref["seq_start"]) * SEQ_MULT_S;
-      mref["seq_end"] = uint64_t(m_ngulps_per_seq + seq_start);
-      int nseqs = m_ngulps_per_seq;
+      mref["time_tag"] = m_time_tag0;
+      mref["seq_end"] = uint64_t(nseqs + seq_start);
       mref["nseqs"] = nseqs;
-      mref["gulp_len_ms"] = (m_ngulps_per_seq)*SAMPLING_LEN_uS * 1e3;
-      mref["nchan"] = uint8_t(m_nchan_in);
-      mref["chan0"] = int64_t(m_chan0);  // to meet alignment requirements
-      mref["data_order"] = "t_maj"s;
+      mref["gulp_len_ms"] = nseqs * (SAMPLING_LEN_uS * 1e-3);
+      mref["nchan"] = nchan_from_file;  // int，支持 1024 通道
+      mref["chan0"] = chan0_from_file;
+      mref["data_order"] = "c_maj"s;
       mref["nbytes"] =
-          m_nchan_in * LWA_SV_NPOLS * nseqs * LWA_SV_NSTANDS * 1 /*bytes*/;
+          uint64_t(nchan_from_file) * LWA_SV_NPOLS * nseqs * LWA_SV_NSTANDS;  // one byte/CNib
 
       output["gulp"].push(pld);
     }

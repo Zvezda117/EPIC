@@ -74,6 +74,14 @@ struct KernelTypeDefs {
   using pixel_buf_config_t = typename EpicPixelTableDataRows<float>::config_t;
   using pixel_pld_t = Payload<typename pixel_buf_t::mbuf_t>;
   using opt_t = cxxopts::ParseResult;
+
+  static OfflineChannelShard DeviceChannelSlice(const opt_t& options, int slot) {
+    const int channels = options["channels"].as<int>();
+    if (!options["offline"].as<bool>()) return {0, channels};
+    return OfflineChannelSlice(channels, options["ngpus"].as<int>(), slot,
+                               options["chan_nbin"].as<int>(),
+                               options["nstreams"].as<int>());
+  }
 };
 
 template <EPICKernelID _kID>
@@ -115,9 +123,12 @@ template <>
 struct Kernel<_DUMMY_PACK_GEN> : KernelTypeDefs {
   using ktype = DummyPktGen<payload_u8_t, LFBufMngr<AlignedBuffer<uint8_t>>>;
   template <unsigned int _GpuId>
-  static ktype get_kernel(const opt_t&) {
+  static ktype get_kernel(const opt_t& options) {
     VLOG(2) << "Creating dummy Pkt gen";
-    return ktype(1);
+    const auto channels = DeviceChannelSlice(options, _GpuId);
+    const std::string path = options.count("npytbnfile")
+                                 ? options["npytbnfile"].as<std::string>() : "";
+    return ktype(1, "", options["nts"].as<int>(), channels.first, channels.count, path);
   }
 };
 using DummyPktGen_kt = Kernel<_DUMMY_PACK_GEN>::ktype;
@@ -150,12 +161,23 @@ struct Kernel<_CORRELATOR> : KernelTypeDefs {
     }
     VLOG(2) << "here";
     auto correlator_options = MOFFCorrelatorDesc();
+    // The offline graph emits one gulp; two output slots also permit one
+    // retained accumulator image without reserving 100 full-size images.
+    if (options["offline"].as<bool>()) correlator_options.nbuffers = 2;
     correlator_options.device_id =
-        gpu_ids.size() > 0 ? gpu_ids[_GpuId] : _GpuId;
+        gpu_ids.size() > 0 ? gpu_ids.at(_GpuId) : _GpuId;
     correlator_options.accum_time_ms = options["seq_accum"].as<int>();
     correlator_options.nseq_per_gulp = options["nts"].as<int>();
+    if (options["offline"].as<bool>()) {
+      // Match the constructor's gulp length so ceil(accum/gulp) is exactly 1.
+      correlator_options.accum_time_ms = static_cast<float>(
+          correlator_options.nseq_per_gulp * SAMPLING_LEN_uS * 1e-3);
+      LOG(INFO) << "Offline integrates one complete NPZ gulp ("
+                << correlator_options.accum_time_ms
+                << " ms); --seq_accum applies to online input";
+    }
     VLOG(2) << "here";
-    correlator_options.nchan_out = options["channels"].as<int>();
+    correlator_options.nchan_out = DeviceChannelSlice(options, _GpuId).count;
     if (options["imagesize"].as<int>() == 64) {
       correlator_options.img_size = HALF;  // defaults to full
     }
@@ -168,6 +190,7 @@ struct Kernel<_CORRELATOR> : KernelTypeDefs {
     correlator_options.kernel_oversampling_factor =
         options["kernel_oversample"].as<int>();
     correlator_options.use_bf16_accum = options["accum_16bit"].as<bool>();
+    correlator_options.is_remove_autocorr = options["remove_autocorr"].as<bool>();
     correlator_options.nstreams = options["nstreams"].as<int>();
     VLOG(2) << "Extracted options";
     auto corr_ptr = std::make_unique<MOFFCorrelator_t>(correlator_options);
@@ -186,7 +209,7 @@ struct Kernel<_CHAN_REDUCER> : KernelTypeDefs {
   static ktype get_kernel(const opt_t& options) {
     VLOG(2) << "Creating chan reducer";
     int imsize = options["imagesize"].as<int>();
-    int im_nchan = options["channels"].as<int>();
+    int im_nchan = DeviceChannelSlice(options, _GpuId).count;
     int chan_nbin = options["chan_nbin"].as<int>();
     return ktype(chan_nbin, imsize, imsize, im_nchan);
   }
@@ -217,7 +240,7 @@ struct Kernel<_PIX_EXTRACTOR> : KernelTypeDefs {
     VLOG(2) << "Creating Pixel extractor";
     KernelTypeDefs::pixel_buf_config_t config;
     int imsize = options["imagesize"].as<int>();
-    int im_nchan = options["channels"].as<int>();
+    int im_nchan = DeviceChannelSlice(options, _GpuId).count;
     int chan_nbin = options["chan_nbin"].as<int>();
     int reduced_nchan = im_nchan / chan_nbin;
     int grid_size = options["imagesize"].as<int>();
@@ -280,7 +303,7 @@ struct Kernel<_ACCUMULATOR> : KernelTypeDefs {
   static ktype get_kernel(const opt_t& options) {
     VLOG(2) << "Creating accumulator";
     int imsize = options["imagesize"].as<int>();
-    int im_nchan = options["channels"].as<int>();
+    int im_nchan = DeviceChannelSlice(options, _GpuId).count;
     int chan_nbin = options["chan_nbin"].as<int>();
     int reduced_nchan = im_nchan / chan_nbin;
     int im_naccum = options["nimg_accum"].as<int>();

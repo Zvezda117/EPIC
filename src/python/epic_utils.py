@@ -8,8 +8,11 @@ from astropy.coordinates import SkyCoord, FK5
 from scipy.signal import correlate2d
 
 import datetime
+import csv
+import os
 import time
 from MCS2 import Communicator
+from pathlib import Path
 import uuid
 from daily_digest import ingest_daily_digest
 
@@ -21,7 +24,127 @@ ADP_EPOCH = datetime.datetime(1970, 1, 1)
 lwasv_station = lwasv
 
 
-def gen_loc_lwasv(grid_size, grid_resolution):
+def _candidate_repo_paths(*parts):
+    roots = [Path.cwd(), Path.cwd().parent, Path(__file__).resolve().parents[2]]
+    seen = set()
+    for root in roots:
+        path = (root / Path(*parts)).resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        yield path
+
+
+def _find_repo_file(env_name, default_name):
+    env_path = os.environ.get(env_name)
+    if env_path:
+        path = Path(env_path).expanduser().resolve()
+        if path.is_file():
+            return path
+        raise FileNotFoundError(f"{env_name} points to a missing file: {path}")
+    for path in _candidate_repo_paths(default_name):
+        if path.is_file():
+            return path
+    return None
+
+
+def _read_simple_yaml(path):
+    try:
+        import yaml
+
+        with open(path, "r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("PyYAML is required to read antenna mapping files") from exc
+
+
+def _load_coordinate_rows(path):
+    rows = {}
+    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            name = row.get("名称") or row.get("name") or row.get("Name")
+            if name:
+                rows[name] = row
+    return rows
+
+
+def _load_custom_array(expected_nstands=None):
+    mapping_path = _find_repo_file("EPIC_ARRAY_CONFIG", "antenna_mapping_9197.yaml")
+    coord_path = _find_repo_file("EPIC_ANTENNA_COORDS", "antenna_coordinates.csv")
+    if mapping_path is None or coord_path is None:
+        return None
+
+    mapping = _read_simple_yaml(mapping_path)
+    index_map = mapping.get("antenna_to_epic_index", {})
+    if not index_map:
+        return None
+
+    ordered = sorted(index_map.items(), key=lambda item: int(item[1]))
+    if expected_nstands is not None and len(ordered) != int(expected_nstands):
+        raise RuntimeError(
+            f"{mapping_path.name} defines {len(ordered)} stands, but this EPIC "
+            f"binary was compiled for {expected_nstands}. Rebuild with matching "
+            "LWA_SV_NSTANDS or select a matching EPIC_ARRAY_CONFIG."
+        )
+
+    rows = _load_coordinate_rows(coord_path)
+    names = [name for name, _ in ordered]
+    missing = [name for name in names if name not in rows and not name.startswith("PAD")]
+    if missing:
+        raise RuntimeError(
+            f"{coord_path.name} has no coordinates for: {', '.join(missing)}"
+        )
+
+    positions = []
+    lon_vals = []
+    lat_vals = []
+    for name in names:
+        if name.startswith("PAD"):
+            positions.append([0.0, 0.0, 0.0])
+            continue
+        row = rows[name]
+        positions.append(
+            [float(row["X/E"]), float(row["Y/N"]), float(row.get("Z/U", 0.0))]
+        )
+        if row.get("longitude") and row.get("latitude"):
+            lon_vals.append(float(row["longitude"]))
+            lat_vals.append(float(row["latitude"]))
+
+    obs = mapping.get("observation", {})
+    return {
+        "name": mapping.get("station", {}).get("name", mapping_path.stem),
+        "positions": np.asarray(positions, dtype=np.double),
+        "antenna_names": names,
+        "lon_deg": float(np.mean(lon_vals)) if lon_vals else None,
+        "lat_deg": float(np.mean(lat_vals)) if lat_vals else None,
+        "center_freq_mhz": obs.get("center_freq_mhz"),
+    }
+
+
+def _station_lon_lat_deg():
+    custom = _load_custom_array()
+    if custom and custom["lon_deg"] is not None and custom["lat_deg"] is not None:
+        return custom["lon_deg"], custom["lat_deg"]
+    return lwasv_station.lon * 180.0 / np.pi, lwasv_station.lat * 180.0 / np.pi
+
+
+def _chan0_from_center_freq(nchan):
+    explicit = os.environ.get("EPIC_CHAN0")
+    if explicit:
+        return int(round(float(explicit)))
+
+    center_mhz = os.environ.get("EPIC_CENTER_FREQ_MHZ")
+    if center_mhz is None:
+        custom = _load_custom_array()
+        if custom and custom.get("center_freq_mhz") is not None:
+            center_mhz = custom["center_freq_mhz"]
+    if center_mhz is None:
+        return 0
+    return int(round(float(center_mhz) * 1e6 / CHAN_BW))
+
+
+def gen_loc_lwasv(grid_size, grid_resolution, nstands=None):
     """
     Generate grid centered locations of LWASV stands compatible with DFT code.
     The indices must be divided by the wavelength to transform the coordinates
@@ -31,12 +154,28 @@ def gen_loc_lwasv(grid_size, grid_resolution):
     grid_resolution: Grid resolution in degrees
     """
 
-    lsl_locsf = np.array(
-        [(ant.stand.x, ant.stand.y, ant.stand.z) for ant in lwasv[::2]]
-    )
-    lsl_locsf[
-        [i for i, a in enumerate(lwasv[::2]) if a.stand.id == 256], :
-    ] = 0.0
+    custom = _load_custom_array(nstands)
+    if custom is not None:
+        lsl_locsf = custom["positions"].copy()
+        names = np.asarray(custom.get("antenna_names", []), dtype=object)
+        if names.size == lsl_locsf.shape[0]:
+            pad_mask = np.asarray([str(name).startswith("PAD") for name in names])
+            if np.any(pad_mask):
+                real_mask = ~pad_mask
+                if not np.any(real_mask):
+                    raise RuntimeError("custom array contains only padding stands")
+                # Padding stands are zero-valued data placeholders used to satisfy
+                # EPIC's compiled input width. Keep them near the array centre so
+                # they do not expand the min/max coordinate span and push the real
+                # L-band antennas off the image grid.
+                lsl_locsf[pad_mask] = np.mean(lsl_locsf[real_mask], axis=0)
+    else:
+        lsl_locsf = np.array(
+            [(ant.stand.x, ant.stand.y, ant.stand.z) for ant in lwasv[::2]]
+        )
+        lsl_locsf[
+            [i for i, a in enumerate(lwasv[::2]) if a.stand.id == 256], :
+        ] = 0.0
 
     # adjusted to ensure the pixel size <= half the wavelength
     delta = (2 * grid_size * np.sin(np.pi * grid_resolution / 360)) ** -1
@@ -55,15 +194,21 @@ def gen_loc_lwasv(grid_size, grid_resolution):
     )
 
 
-def gen_phases_lwasv(nchan, chan0):
+def gen_phases_lwasv(nchan, chan0, nstands=None, npol=2):
     """
     Generate complex phases for the LWA-SV antennas
 
     nchan: Number of channels
     chan0: Channel number of the first channel
     """
+    custom = _load_custom_array(nstands)
+    if custom is not None:
+        nstand = int(nstands or custom["positions"].shape[0])
+        phases = np.ones((nchan, nstand, int(npol)), dtype=np.complex128)
+        return phases.ravel().copy()
+
     nstand = int(len(lwasv.antennas) / 2)
-    npol = 2
+    npol = int(npol)
     phases = np.zeros((nchan, nstand, npol), dtype=np.complex64)
     bandwidth = CHAN_BW
     freq = np.arange(chan0, chan0 + nchan) * bandwidth
@@ -126,7 +271,10 @@ def save_output(output_arr, grid_size, nchan, outdir, metadata):
     sll = (
         2 * metadata["grid_size"] * np.sin(np.pi * metadata["grid_res"] / 360)
     ) ** -1
-    cfreq = (metadata["chan0"] + metadata["nchan"] / 2 - 1) * CHAN_BW
+    from imaging_math import output_frequency_axis
+    _, cfreq, delta_f = output_frequency_axis(
+        metadata["chan0"], nchan, metadata.get("chan_width", CHAN_BW), CHAN_BW
+    )
 
     phdu.header["BUNITS"] = "UNCALIB"
     phdu.header["BSCALE"] = 1e0
@@ -154,23 +302,20 @@ def save_output(output_arr, grid_size, nchan, outdir, metadata):
     )
     delta_x = -dtheta_x * 180.0 / np.pi
     delta_y = dtheta_y * 180.0 / np.pi
-    delta_f = CHAN_BW
 
     crit_pix_f = (metadata["nchan"] - 1) * 0.5 + 1  # +1 for FITS numbering
 
+    lon_deg, lat_deg = _station_lon_lat_deg()
     t0 = Time(
         metadata["time_tag"] / FS,
         format="unix",
         precision=6,
-        location=(
-            lwasv_station.lon * 180.0 / np.pi,
-            lwasv_station.lat * 180.0 / np.pi,
-        ),
+        location=(lon_deg, lat_deg),
     )
 
     lsts = t0.sidereal_time("apparent")
     coords = SkyCoord(
-        lsts.deg, lwasv_station.lat * 180.0 / np.pi, obstime=t0, unit="deg"
+        lsts.deg, lat_deg, obstime=t0, unit="deg"
     ).transform_to(FK5(equinox="J2000"))
 
     # img_data = np.transpose(output_arr[:, :, :, :], (0, 1, 3, 2))
@@ -201,23 +346,30 @@ def save_output(output_arr, grid_size, nchan, outdir, metadata):
     ihdu.header["CRVAL3"] = cfreq
     ihdu.header["CUNIT3"] = "Hz"
     # # Coordinates - Stokes parameters
-    ihdu.header["CTYPE4"] = "STOKES"
+    ihdu.header["CTYPE4"] = "CORRPROD"
     ihdu.header["CRPIX4"] = 1
-    ihdu.header["CDELT4"] = -1
-    ihdu.header["CRVAL4"] = -5  # pol_nums[pol_order[0]]
+    ihdu.header["CDELT4"] = 1
+    ihdu.header["CRVAL4"] = 1
+    ihdu.header["POLPROD"] = "XX,YY,RE_XY,IM_XY"
+    ihdu.header["POLCONV"] = "XY=X*conj(Y)"
 
     hdulist = fits.HDUList([phdu, ihdu])
     unix_time = metadata["time_tag"] / FS +\
      1e-3 * metadata["img_len_ms"] / 2.0
     filename = f"EPIC_{unix_time:.3f}_{cfreq/1e6:.3f}MHz"
-    hdulist.writeto(f"{outdir}{filename}.fits", overwrite=True)
+    os.makedirs(outdir, exist_ok=True)
+    fits_path = os.path.join(outdir, f"{filename}.fits")
+    png_path = os.path.join(outdir, f"{filename}_QL.png")
+    hdulist.writeto(fits_path, overwrite=True)
 
-    matplotlib.image.imsave(f"{outdir}{filename}_QL.png", img_data[0, 0, :, :], origin="lower")
+    matplotlib.image.imsave(
+        png_path, np.nan_to_num(img_data[0, 0, :, :], nan=0.0), origin="lower"
+    )
 
     # extract and ingest the pixels to DB
     # ingest_daily_digest(ihdu.header, phdu.header, img_data, cfreq)
 
-    return f"{outdir}{filename}.fits"
+    return fits_path
 
 
 def get_ADP_time_from_unix_epoch():
@@ -261,27 +413,16 @@ def get_time_from_unix_epoch(utcstart):
     return (utc_start_dt - ADP_EPOCH).total_seconds()
 
 
-def get_40ms_gulp():
+def get_40ms_gulp(nstands=16, npols=2, expected_nseqs=None, capacity_bytes=None,
+                  channel_start=0, channel_count=None, input_path=None):
+    """Load quantized NPZ voltages and return the GPU's channel-major layout.
+
+    The NPZ stays time-major on disk. Metadata keeps the logical time/channel
+    shape; only the contiguous voltage buffer is transposed for CUDA.
     """
-    Generate a 40 ms gulp from an npz file
-    """
-    # npfile=np.load("data/40ms_128chan_gulp_c64.npz")
-    # npfile=np.load("data/40ms_128chan_gulp_c64_virtransit.npz")
-    npfile = np.load("data/40ms_128chan_600offset_gulp_c64_virtransit.npz")
-    # npfile = np.load("data/40ms_1chan_sim_50MHz.npz")
-    # npfile = np.load("data/40ms_1chan_sim_50MHz_orig_beam.npz")
-    # npfile = np.load("data/40ms_1chan_sim_50MHz_L2.npz")
-    # npfile = np.load("data/40ms_1chan_sim_50MHz_asymm.npz")
-    meta = np.concatenate(
-        (npfile["meta"].ravel(), [npfile["data"].size], npfile["data"].shape)
-    )
-    # _data = npfile["data"].copy()
-    # for i in range(20):
-    #     print(i,np.min(_data[i,1,:,:]))
-    return dict(
-        meta=meta.astype(np.double).ravel().copy(),
-        data=npfile["data"].ravel().copy(),
-    )
+    from offline_io import load_gulp
+    return load_gulp(nstands, npols, expected_nseqs, capacity_bytes,
+                     channel_start, channel_count, input_path)
 
 
 def gaussian(x, mu=0, sigma=4):
@@ -319,65 +460,9 @@ def get_gaussian_2D(support=3):
 
 
 def get_correction_grid(corr_ker_arr, grid_size, support, nchan, oversample=1):
-    """
-    Generates a correction grid based on the specified kernels
-
-    corr_ker_arr: Correction kernel array for each frequency
-    grid_size: 1D size of the correction grid
-    support: Support size
-    nchan: Number of channels in the correction grid
-    """
-    grid_size_orig = grid_size
-    grid_size = int(grid_size * oversample)
-    corr_ker_arr = corr_ker_arr.reshape((nchan, support, support))
-    corr_grid_arr = np.zeros((nchan, grid_size, grid_size))
-
-    offset = (grid_size - grid_size_orig) // 2
-
-    kernel_offset = int(grid_size / 2)
-    for i in range(nchan):
-        corr_grid_arr[
-            i,
-            kernel_offset : kernel_offset + support,
-            kernel_offset : kernel_offset + support,
-        ] = corr_ker_arr[
-            i, :, :
-        ]  # * g2d
-    matplotlib.image.imsave(
-        "gpu_corr_kernel_raw.png", (corr_grid_arr[0, :, :])
-    )
-    X, Y = np.mgrid[0:grid_size, 0:grid_size]
-    phase_correction = 1  # np.exp(-1j * 2 * np.pi / grid_size * (Y))
-
-    corr_grid_arr = (
-        np.absolute(
-            np.fft.fftshift(
-                np.transpose(  # cuFFTDx generates the transpose of the image
-                    np.fft.fftshift(
-                        np.fft.ifft2(corr_grid_arr * phase_correction)
-                    )[
-                        :,
-                        offset : offset + grid_size_orig,
-                        offset : offset + grid_size_orig,
-                    ][
-                        :, :, :
-                    ],
-                    axes=(0, 2, 1),
-                )
-            )
-        )
-        ** 2
-    )
-    matplotlib.image.imsave(
-        "gpu_corr.png", (np.fft.fftshift(corr_grid_arr[0, :, :]))
-    )
-    matplotlib.image.imsave("gpu_corr_kernel.png", (corr_ker_arr[0, :, :]))
-    ac = corr_ker_arr[0, :, :] / corr_ker_arr[0, :, :].sum()
-
-    corr_grid_arr = np.reciprocal(corr_grid_arr)
-
-    np.savez('corr_grid_arr.npz',corr_grid_arr)
-    return (corr_grid_arr).copy().ravel()
+    """Return the inverse gridding power response, without shared debug files."""
+    from imaging_math import correction_grid
+    return correction_grid(corr_ker_arr, grid_size, support, nchan, oversample).ravel()
 
 
 def get_random_uuid():

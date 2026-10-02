@@ -89,7 +89,7 @@ class Streamer {
   AVStream *videoStream{nullptr};
   AVCodecContext *codecContext{nullptr};
   AVDictionary *codec_options{nullptr};
-  AVCodec *videoCodec;
+  const AVCodec *videoCodec;  // const for FFmpeg 4.0+ compatibility
   int m_vid_frame_size{0};
   uint64_t m_frame_PTS{0};
   uint8_t *framebuf{nullptr};
@@ -620,8 +620,8 @@ void Streamer::StreamImage() {
     // Free packet data
     // av_frame_unref(scaledFrame);
     // av_frame_unref(frame);
-    av_free_packet(pkt);
-    av_packet_unref(pkt);
+    // av_free_packet(pkt);  // Removed: deprecated in FFmpeg 4.0+
+    av_packet_unref(pkt);  // Use this instead
     // av_free(pkt);
     // ++_frame_counter;
   }

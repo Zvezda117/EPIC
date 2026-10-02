@@ -1066,3 +1066,10 @@ src/extern/RaftLib/build
 build2/
 
 !.swm/
+# Local observations, generated products, and vendor downloads
+/data/
+/results/
+/repair-build/
+/nvidia-mathdx-22.11.0-Linux/
+/corr_grid_arr.npz
+/gpu_corr*.png

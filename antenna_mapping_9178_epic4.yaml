@@ -1,0 +1,34 @@
+# 9178 Crab experimental 4-stand subset for the current EPIC binary.
+# Coordinates are loaded from antenna_coordinates.csv by antenna name.
+
+station:
+  name: "LBAND-9178-CRAB-EPIC4"
+  nstands: 4
+  npols: 2
+
+antenna_to_epic_index:
+  北4: 0
+  北3: 1
+  东4: 2
+  东3: 3
+
+terminal_mapping:
+  HBaseband0Spec0:
+    pol0: "北4"
+    pol0_polarization: "V"
+    pol1: "北3"
+    pol1_polarization: "V"
+    terminal_name: "H00"
+  HBaseband1Spec1:
+    pol0: "东4"
+    pol0_polarization: "H"
+    pol1: "东3"
+    pol1_polarization: "V"
+    terminal_name: "H11"
+
+observation:
+  source_name: "Crab"
+  center_freq_mhz: 1355
+  bandwidth_mhz: 250
+  data_dir: "/mnt/data_ssd/zdj/data/9178"
+  note: "4-input subset duplicated into EPIC dual-pol slots for first imaging test."

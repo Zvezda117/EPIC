@@ -288,7 +288,7 @@ void InsertFilenametoDb(_Pld* pld_ptr, pqxx::work* work_ptr,
   auto& meta = pld_ptr->get_mbuf()->GetMetadataRef();
   auto filename = std::get<std::string>(meta["filename"]);
   auto chan_width = std::get<int>(meta["chan_width"]);
-  int nchan = std::get<uint8_t>(meta["nchan"]);
+  int nchan = std::get<int>(meta["nchan"]);
   auto support = std::get<int>(meta["support_size"]);
   auto gulp_len = std::get<double>(meta["gulp_len_ms"]);
   auto image_len = std::get<double>(meta["img_len_ms"]);

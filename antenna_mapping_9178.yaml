@@ -1,0 +1,88 @@
+# 天线接线映射配置 - 9178数据集
+# 基于用户提供的新接线图
+
+station:
+  name: "LBAND-9178-CRAB"
+  nstands: 10
+  npols: 2
+
+antenna_to_epic_index:
+  北4: 0
+  北3: 1
+  东4: 2
+  东3: 3
+  东5: 4
+  东6: 5
+  东9: 6
+  东10: 7
+  东7: 8
+  东8: 9
+
+# 文件到天线的映射
+terminal_mapping:
+  # 终端1: 北4垂直, 北3垂直
+  HBaseband0Spec0:
+    pol0: "北4"
+    pol0_polarization: "V"
+    pol1: "北3"
+    pol1_polarization: "V"  # 垂直
+    terminal_name: "H00"
+    
+  # 终端2: 东4水平, 东3垂直（先4后3）
+  HBaseband1Spec1:
+    pol0: "东4"
+    pol0_polarization: "H"
+    pol1: "东3"
+    pol1_polarization: "V"
+    terminal_name: "H11"
+    note: "明确：先东4H，后东3V"
+    
+  # 终端3: 东5水平, 东6水平
+  HBaseband2Spec2:
+    pol0: "东5"
+    pol0_polarization: "H"
+    pol1: "东6"
+    pol1_polarization: "H"
+    terminal_name: "H22"
+    note: "两个都是水平极化"
+    
+  # 终端4: 东4垂直, 东5垂直
+  VBaseband0Spec0:
+    pol0: "东4"
+    pol0_polarization: "V"
+    pol1: "东5"
+    pol1_polarization: "V"
+    terminal_name: "V00"
+    note: "东4V应该和终端2的东4H是同一天线的双极化！"
+    
+  # 终端5: 东9水平, 东10垂直
+  VBaseband1Spec1:
+    pol0: "东9"
+    pol0_polarization: "H"
+    pol1: "东10"
+    pol1_polarization: "V"
+    terminal_name: "V11"
+    
+  # 终端6: 东7水平, 东8垂直
+  VBaseband2Spec2:
+    pol0: "东7"
+    pol0_polarization: "H"
+    pol1: "东8"
+    pol1_polarization: "V"
+    terminal_name: "V22"
+
+# 预期的双极化天线（根据接线图）
+expected_dual_pol_antennas:
+  东4:
+    H: "HBaseband1Spec1 pol0"
+    V: "VBaseband0Spec0 pol0"
+  东5:
+    H: "HBaseband2Spec2 pol0"
+    V: "VBaseband0Spec0 pol1"
+
+# 观测参数
+observation:
+  center_freq_mhz: 1355
+  bandwidth_mhz: 250
+  source_name: "Crab"
+  data_dir: "/mnt/data_ssd/zdj/data/9178"

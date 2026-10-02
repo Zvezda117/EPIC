@@ -25,6 +25,7 @@
 
 #include <hwy/highway.h>
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <memory>
@@ -91,7 +92,7 @@ class MOFFCorrelator : public MOFFCuHandler {
   // int m_support_size;
   int m_gcf_tex_dim;
   bool m_rm_autocorrs{false};
-  // int m_nchan_in{ 132 };
+  int m_nchan_in{0};  // 从 gulp metadata 读取，初始为 0
   int m_nchan_out{128};
   int m_chan0{0};
   size_t m_nseq_per_gulp;
@@ -210,8 +211,7 @@ MOFFCorrelator<Dtype, BuffMngr>::MOFFCorrelator(MOFFCorrelatorDesc p_desc) {
       << "Number of sequences per gulp must be >0.";
 
   m_rm_autocorrs = p_desc.is_remove_autocorr;
-  LOG_IF(ERROR, m_rm_autocorrs)
-      << "Autocorrelation removal is not supported yet.";
+  this->m_remove_autocorr = m_rm_autocorrs;
 
   m_nstreams = p_desc.nstreams;
   LOG_IF(FATAL, (m_nstreams < 1 || m_nstreams > MAX_GULP_STREAMS))
@@ -246,9 +246,7 @@ MOFFCorrelator<Dtype, BuffMngr>::MOFFCorrelator(MOFFCorrelatorDesc p_desc) {
 
   VLOG(3) << "Setting up the buffer manager";
   LOG_IF(FATAL, p_desc.nbuffers <= 0) << "Total numbers of buffers must be >0";
-  LOG_IF(FATAL, p_desc.buf_size <= 0)
-      << "Buffer size must be at least one byte.";
-  m_mbuf_mngr = std::make_unique<BuffMngr>(p_desc.nbuffers, p_desc.buf_size,
+  m_mbuf_mngr = std::make_unique<BuffMngr>(p_desc.nbuffers, p_desc.OutputBufferElements(),
                                            p_desc.max_tries_acq_buf,
                                            p_desc.page_lock_bufs);
   VLOG(3) << "Done setting up the correlator";
@@ -268,8 +266,10 @@ bool MOFFCorrelator<Dtype, BuffMngr>::ResetImagingConfig(int p_nchan,
 
   if (p_nchan != m_nchan_in) {
     m_nchan_in = p_nchan;
+    VLOG(2) << "ResetImagingConfig: p_nchan=" << p_nchan << " m_nchan_in=" << m_nchan_in << " m_nchan_out=" << m_nchan_out;
     if (m_nchan_out > m_nchan_in) {
-      LOG(FATAL) << "Number of output channels exceeds the input channels";
+      LOG(FATAL) << "Number of output channels (" << m_nchan_out
+                 << ") exceeds the input channels (" << m_nchan_in << ")";
     }
     this->m_f_eng_bytes = m_nchan_in * LWA_SV_INP_PER_CHAN * m_nseq_per_gulp;
     this->m_nbytes_f_eng_per_stream = m_f_eng_bytes / m_nstreams;
@@ -282,7 +282,9 @@ bool MOFFCorrelator<Dtype, BuffMngr>::ResetImagingConfig(int p_nchan,
 
   // Reset the gridding kernel because effective area changes with freq
   auto aeff = GetAEff(p_chan0);
-  m_gcf_tex_dim = sqrt(aeff) * 10;  // in decimeters
+  int freq_gcf_tex_dim =
+      std::max(1, static_cast<int>(std::ceil(std::sqrt(aeff) * 10)));
+  m_gcf_tex_dim = std::max(m_gcf_tex_dim, freq_gcf_tex_dim);
   VLOG(3) << "Initializing GCF texture. New Aeff: " << aeff << " sq. m "
           << m_gcf_tex_dim;
   ResetGcfKernel2D(m_gcf_tex_dim);
@@ -313,6 +315,7 @@ bool MOFFCorrelator<Dtype, BuffMngr>::ResetImagingConfig(int p_nchan,
   //  m_support_size = orig_support;
   this->ResetGcfElem(m_nchan_out, m_support_size, m_chan0, m_delta,
                      m_grid_size);
+  if (m_rm_autocorrs) this->ResetAutoCorrPower(m_nchan_out, m_grid_size, m_support_size);
 
   return true;
 }

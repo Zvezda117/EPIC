@@ -160,7 +160,8 @@ double GetLwasvLocs(T* out_ptr, int grid_size, double grid_resolution) {
   VLOG(2) << "Grid size: " << grid_size << " grid res: " << grid_resolution;
 
   auto ret_dict = py::module_::import("epic_utils")
-                      .attr("gen_loc_lwasv")(grid_size, grid_resolution);
+                      .attr("gen_loc_lwasv")(grid_size, grid_resolution,
+                                             static_cast<int>(LWA_SV_NSTANDS));
   VLOG(2) << "Generated locations.";
 
   double delta = ret_dict["delta"].cast<double>();
@@ -191,7 +192,9 @@ void GetLwasvPhases(T* out_ptr, int nchan, int chan0) {
   auto np = py::module_::import("numpy");
   auto phases_arr =
       py::module_::import("epic_utils")
-          .attr("gen_phases_lwasv")(nchan, chan0)
+          .attr("gen_phases_lwasv")(nchan, chan0,
+                                     static_cast<int>(LWA_SV_NSTANDS),
+                                     static_cast<int>(LWA_SV_NPOLS))
           .cast<py::array_t<std::complex<double>,
                             py::array::c_style | py::array::forcecast>>();
   VLOG(3) << "Received phases data";
@@ -206,45 +209,62 @@ void GetLwasvPhases(T* out_ptr, int nchan, int chan0) {
 }
 
 /**
- * @brief Generate a 40 ms gulp from a TBN file
+ * @brief Generate a gulp from npz (40ms or 1s integration).
+ * meta: [tstart, chan0, 2*size, shape0, shape1, ...]; shape0 = nseqs.
  *
  * @tparam T Output data precision
  * @param out_ptr Pointer to the output buffer
+ * @param out_nseqs If non-null, set to meta[3] (ntime/sequences per gulp)
+ * @param out_nchan If non-null, set to meta[4]
+ * @param out_chan0 If non-null, set to meta[1] (chan0)
  */
 template <typename T>
-void Get40msGulp(T* out_ptr) {
-  VLOG(3) << "Grabbing a 40ms gulp";
+void Get40msGulp(T* out_ptr, size_t capacity_bytes, int expected_nseqs,
+                 int* out_nseqs = nullptr, int* out_nchan = nullptr,
+                 int64_t* out_chan0 = nullptr, int channel_start = 0,
+                 int channel_count = 0, const std::string& input_path = "",
+                 double* out_unix_start = nullptr) {
+  static_assert(sizeof(T) == 1, "Offline CNib destination must be byte-addressed");
   py::gil_scoped_acquire acquire;
-  auto gulp_dict = py::module_::import("epic_utils").attr("get_40ms_gulp")();
-
-  auto meta_arr =
-      gulp_dict["meta"]
-          .cast<
-              py::array_t<double, py::array::c_style | py::array::forcecast>>();
-  auto data_arr =
-      gulp_dict["data"]
-          .cast<py::array_t<std::complex<double>,
-                            py::array::c_style | py::array::forcecast>>();
-
-  // tstart, chan0, size, ntime, nchan, nstand, npol
-  auto meta_ptr = static_cast<double*>(meta_arr.request().ptr);
-
-  // dimensions ntime, nchan, nstand, npol
-  auto data_ptr = static_cast<double*>(data_arr.request().ptr);
-
-  // copy it to the out_ptr
-  auto out_nib2 = reinterpret_cast<CNib*>(out_ptr);
-
-  VLOG(3) << "Copying " << meta_ptr[2] << " elements into the output array";
-  int ncomplex_vals = meta_ptr[2] / 2;
-  CHECK(static_cast<int>(meta_ptr[2]) % 2 == 0)
-      << "Invalid gulp array. The total number of elements is an odd number.";
-  for (auto i = 0; i < ncomplex_vals; ++i) {
-    out_nib2[i].re = data_ptr[2 * i];
-    out_nib2[i].im = data_ptr[2 * i + 1];
-    // if(i==1){
-    //     VLOG(3)<<"GUlp data: "<<data_ptr
-    // }
+  CHECK_GE(channel_start, 0);
+  CHECK_GE(channel_count, 0);
+  py::object count = py::none();
+  if (channel_count > 0) count = py::cast(channel_count);
+  py::object path = py::none();
+  if (!input_path.empty()) path = py::cast(input_path);
+  auto gulp_dict = py::module_::import("epic_utils").attr("get_40ms_gulp")(
+      int(LWA_SV_NSTANDS), int(LWA_SV_NPOLS), expected_nseqs, capacity_bytes,
+      channel_start, count, path);
+  auto meta_arr = gulp_dict["meta"].cast<
+      py::array_t<double, py::array::c_style | py::array::forcecast>>();
+  auto data_arr = gulp_dict["data"].cast<
+      py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast>>();
+  CHECK_EQ(meta_arr.size(), 7) << "Invalid offline metadata length";
+  auto meta = meta_arr.data();
+  CHECK_EQ(meta[3], expected_nseqs) << "NPZ sequence count differs from --nts";
+  CHECK_EQ(meta[5], LWA_SV_NSTANDS);
+  CHECK_EQ(meta[6], LWA_SV_NPOLS);
+  CHECK_GT(meta[1], 0);
+  CHECK_GT(meta[4], 0);
+  if (channel_count > 0)
+    CHECK_EQ(meta[4], channel_count) << "NPZ channel shard differs from the GPU configuration";
+  CHECK_LE(meta[1] + meta[4] - 1,
+           std::numeric_limits<int>::max() / BANDWIDTH)
+      << "Offline channel frequency exceeds the integer geometry model";
+  CHECK_EQ(meta[2], 2.0 * data_arr.size()) << "Invalid offline payload count";
+  CHECK_EQ(meta[3] * meta[4] * meta[5] * meta[6], data_arr.size());
+  CHECK_LE(size_t(data_arr.size()), capacity_bytes) << "Offline input exceeds buffer";
+  if (out_nseqs) *out_nseqs = int(meta[3]);
+  if (out_nchan) *out_nchan = int(meta[4]);
+  if (out_chan0) *out_chan0 = int64_t(meta[1]);
+  if (out_unix_start) *out_unix_start = meta[0];
+  auto out = reinterpret_cast<CNib*>(out_ptr);
+  const auto* voltages = data_arr.data();
+  // Python has validated finite integral components in [-8, 7] and converted
+  // the time-major NPZ to the channel-major order required by BlockEpicImager.
+  for (py::ssize_t i = 0; i < data_arr.size(); ++i) {
+    out[i].re = int(voltages[i].real());
+    out[i].im = int(voltages[i].imag());
   }
 }
 

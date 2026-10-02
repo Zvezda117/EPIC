@@ -1,0 +1,80 @@
+通用 EPIC 与 LWA_EPIC 数学意图对照（只读源代码比较，2026-10-02）
+
+固定版本与证据口径
+G = https://github.com/epic-astronomy/EPIC ，master c2bd68b792a5269cfffe1d93b4710eae9ba8ca55。
+    本地 /mnt/data_ssd/zdj/lwa_epic_review_20261002/upstream_EPIC；下文 G 行号为该提交文件行号。
+L = https://github.com/epic-astronomy/LWA_EPIC ，origin/phoenix 44bb9b43cf8a13a39e572e1a721b5e9473faf63f。
+O = 同库 origin/aiyuan/offline 93aab8c88a756e0c0a3c145ff9e8980611e4d400。
+    下文 L 行号通过 git show 读取，不受正在修改的工作区影响。
+    用户任务中的 origin/phoenix/aiyuan/offline 被解释为两个实际存在的分支。
+    L 与 O 的 src/ex/fft_dx.cuh、gridder.cuh、cu_helpers.cuh、MOFF_cu_handler.cu 数学代码相同；
+    MOFF_correlator.hpp 差异主要为日志，Python correction grid 相同。
+    fft_dx.cuh 两分支 SHA256 均为 2b1b6ce49368c3259193e0fe99424dbbcd0391beebdd52c2ece81e57b2abb82a。
+
+1. 电压成像主链：数学家族相同，实现与输出契约不同。
+G epic/antenna_array.py:12334-12349：每天线/每频道 aperture kernel 按其和归一化，构造映射矩阵。
+G :12431-12451：先应用天线 flag 权重，再分别映射 illumination 与复杂 E-field 到同一格点。
+G :7147-7157：二维 FFT 得到 holographic voltage；先保留复 holimg，再计算 abs(voltage)^2 和波束。
+G 电压 MOFF 分支 :7096-7099 只迭代 P1/P2；其 P11/P12/P21/P22 在 :7186-7190 的 visibility/FX 分支。
+因此该 master 的电压成像分支不能直接作为 LWA GPU 四平面 XX/YY/ReXY/ImXY 实现的逐行模板。
+L src/ex/fft_dx.cuh:193-239：每个时间 sequence 电压 grid -> 两轴 IFFT -> ComputeXX/YY/UU/VV -> 时间求和。
+L src/ex/gridder.cuh:550-578：对两个极化应用各自复增益、kernel，随后改排 RRII。
+L src/ex/cu_helpers.cuh:468-522：XX/YY 表示各极化模平方；UU/VV 注释意图为 Re(XY*)、Im(XY*)。
+注意：L 原始 ComputeUU:505 与 RRII 布局不符，这是源中已有的代数错误，不是“主线如此所以正确”。
+安全比较标准是统一 FFT 符号/图像朝向后，对同一电压定义 Zx、Zy，验证
+  XX=|Zx|^2，YY=|Zy|^2，ReXY=Re(Zx*conj(Zy))，ImXY=Im(Zx*conj(Zy))。
+
+2. FFT 与归一化：不可直接拿两套输出的绝对像素值互比。
+G :7147-7157 使用 NumPy fft2；输出复电压除 sum_wts，功率除 sum_wts^2。
+G sum_wts 定义在 :7123，为 abs(grid_weight*illumination) 的格点和。
+G 自相关处理后的输出再次用剩余 aperture-plane 权重归一化，见 :7788-7789、:8306-8315。
+G :7755-7759、:8007-8013 对时间计数/权重取平均。
+L src/ex/fft_dx.cuh:69-89 使用两次 inverse cuFFTDx transform，中间 TransposeTri 固定缩放 1/64 (:83)，
+  :236-239 又把形成的功率乘 row_size，:271-274 再乘 correction grid；时间序列和 gulp 采用累加。
+  输出写入 :269-278：is_first_gulp 替换，后续 gulp 加法。
+L :282-295 定义 64/128/81 大小 inverse FFT；因此固定 1/64 不随 row_size 自动变化。
+这些是数值量程/图像响应/总暴露的混合历史约定，不等价于 G 的权重归一化。
+修复前必须定义“每样本平均功率”还是“样本求和”，然后分别验证 grid size、时间长度、频道合并与 kernel oversampling 的尺度。
+
+3. 平均 gridding 核 power correction：LWA 有明确意图，通用 EPIC 没有同名等价替换。
+L src/ex/cu_helpers.cuh:328-343：逐天线 kernel sum 归一化。
+L :359-384 ComputeAvgGriddingKernel：跨所有编译天线求和，再把最终 kernel 的元素和归一化为 1。
+L src/ex/MOFF_correlator.hpp:401-407：GPU 得到平均 kernel -> Python correction -> GPU 像素 correction。
+L src/python/epic_utils.py:321-380：把平均 kernel 放入 oversampled 格点，ifft2，裁剪/转置/shift，
+  取 abs(.)^2，再 reciprocal；L src/ex/fft_dx.cuh:271-274 最终乘到四平面。
+因此其意图为消除电压 gridding 卷积的功率响应：图像功率除 |F(kernel_avg)|^2。
+其 FFT 归一化、裁剪和 transpose 均属于约定的一部分，不能只替换 reciprocal 或只归一化 kernel。
+平均单一 kernel 还隐含同质天线响应的近似；PAD、缺极化、flag 与异构天线未在该平均函数中设有效权重。
+G :12702-12710 对各 aperture 类型先构造 abs(FFT(single-antenna aperture))^2，并变回 UV 自相关 footprint；
+  :13004-13010 按实际 cross antenna-pair 数量组合各类型；:8221-8230 显式评估相应 power pattern。
+它是天线孔径/成对响应模型，不能视为 LWA 的平均插值核倒数模板，也不能由此宣称 LWA 已完成实际主波束/通量校准。
+
+4. 自相关开关与功率模型：G 显式选择，L 原始 GPU 部分无条件执行。
+G Image.average :7619-7647 明确支持 rmfit、mask、none；:7673-7676 校验参数。
+  none 在 :7754-7759 保留自相关，只作时间平均。
+  mask 在 :7721-7722 把自相关 footprint 的 UV 数据/权重格点置零。
+  rmfit 在 :7724 拟合中央幅度并减 footprint。
+  G Image.removeAutoCorr :8304-8315 同时减数据与权重，并用剩余权重重新归一化。
+  G scripts/run_EPIC.py:305-309 当前示例先做电压成像，再调用平均时 autocorr_op='mask'。
+L src/ex/MOFF_correlator.hpp:209-211 虽接收 is_remove_autocorr，却报“not supported yet”。
+  L src/ex/fft_dx.cuh:216-220 无条件累积各天线自功率；:253-264 无条件变换并减 XX/YY auto。
+  XY 分支存在于 gridder.cuh:566-571，但此核调用中不进行 XY auto 扣除。
+  XX/YY 的 auto gridding 使用 |gain| 而非 |gain|^2 (gridder.cuh:562-563)，
+  并将功率乘单次 voltage kernel 后 IFFT；与逐天线 |F(kernel)|^2 footprint 不是天然同一式。
+  不能把“无条件 auto 扣除”说成此开关已被正确执行，也不能只更改开关而宣称自相关模型已验证。
+适合最小验收：单天线保持 auto 时获得正的 beam-shaped 功率；去 auto 时为零；
+  两天线得到显式基线相关参考；非单位复增益、不同 kernel、不同缺极化/flag 都要测试。
+
+5. 可继承的依据与应隔离的历史差异。
+可继承：先 grid 电压，再空间 transform，之后形成相关；卷积的电压响应平方影响功率；
+  自相关取舍和有效权重必须显式记录；时间“和”与“均值”必须明确。
+不能直接移植：G fft2 与 L inverse FFT 的符号/翻转、G 默认两倍 padding、
+  G 权重归一化与 L 固定中间 FFT scale、G aperture-pair 模型与 L 平均 kernel、
+  G UV mask/rmfit 与 L GPU image-domain auto 减法、G 电压仅 P1/P2 与 L 四平面输出。
+G README.rst:9 明确是历史 Python 2 代码；这次只读静态比较，未运行该项目或 GPU。
+G 异构 pair 分支 :12712-12717 本身疑似把第一个 aperture 复用到两个因子，
+  因此其实现也不能未经独立代数/数值验证就作为异构天线的标准真值。
+
+结论：这些固定版本提供算法来源证据，不提供当前 L-band 科学正确性的自动背书。
+第一批 CPU 修复应使用显式电压/基线代数、已知几何 tone 与清楚的元数据契约验收；
+GPU 功率校正、自相关和绝对尺度应在独立参考模型建立后分阶段处理。

@@ -1,0 +1,97 @@
+# 天线接线映射配置
+# 基于用户提供的接线图
+#
+# 数据文件格式：HBaseband[i]Spec[i]_*.data / VBaseband[i]Spec[i]_*.data
+# 每个文件包含2个极化通道交织
+
+station:
+  name: "LBAND-12-SINGLEPOL"
+  nstands: 12  # 12个独立单极化天线
+  npols: 1     # 每个天线只有一个极化
+
+# 文件到天线的映射
+# 每个文件有2个通道，但它们是2个独立的单极化天线（不是同一天线的H+V）
+terminal_mapping:
+  # 终端1: H00
+  HBaseband0Spec0:
+    pol0: "天线01"  # 原标记：东1水平
+    pol0_polarization: "H"
+    pol1: "天线02"  # 原标记：北3垂直
+    pol1_polarization: "V"
+    terminal_name: "H00"
+    note: "相关性-0.007，确认是两个独立天线"
+    
+  # 终端2: H11  
+  HBaseband1Spec1:
+    pol0: "天线03"  # 原标记：东4水平
+    pol0_polarization: "H"
+    pol1: "天线04"  # 原标记：东3垂直
+    pol1_polarization: "V"
+    terminal_name: "H11"
+    note: "相关性0.023，确认是两个独立天线"
+    
+  # 终端3: H12
+  HBaseband2Spec2:
+    pol0: "天线05"  # 原标记：东5水平
+    pol0_polarization: "H"
+    pol1: "天线06"  # 原标记：东6水平
+    pol1_polarization: "H"
+    terminal_name: "H12"
+    note: "相关性-0.006，确认是两个独立天线。东5可能是双极化（见下）"
+    
+  # 终端4: V00
+  VBaseband0Spec0:
+    pol0: "天线07"  # 原标记：东4垂直
+    pol0_polarization: "V"
+    pol1: "天线08"  # 原标记：东5垂直（与天线05相关性0.43！）
+    pol1_polarization: "V"
+    terminal_name: "V00"
+    note: "天线08与天线05的相关性0.43，可能是同一天线的双极化"
+    
+  # 终端5: V11
+  VBaseband1Spec1:
+    pol0: "天线09"  # 原标记：东9水平
+    pol0_polarization: "H"
+    pol1: "天线10"  # 原标记：东10垂直
+    pol1_polarization: "V"
+    terminal_name: "V11"
+    note: "相关性-0.003，确认是两个独立天线"
+    
+  # 终端6: V22
+  VBaseband2Spec2:
+    pol0: "天线11"  # 原标记：东7水平
+    pol0_polarization: "H"
+    pol1: "天线12"  # 原标记：东8垂直
+    pol1_polarization: "V"
+    terminal_name: "V22"
+    note: "相关性-0.010，确认是两个独立天线。天线12功率较低(0.75)"
+
+# 天线到EPIC输入的最终映射
+# 实际配置：12个独立天线（不是6天线×2极化）
+# 按编号排序
+antenna_to_epic_index:
+  "天线01": 0   # HBaseband0 pol0 (原:东1H)
+  "天线02": 1   # HBaseband0 pol1 (原:北3V)
+  "天线03": 2   # HBaseband1 pol0 (原:东4H)
+  "天线04": 3   # HBaseband1 pol1 (原:东3V)
+  "天线05": 4   # HBaseband2 pol0 (原:东5H) - 可能与天线08是双极化
+  "天线06": 5   # HBaseband2 pol1 (原:东6H)
+  "天线07": 6   # VBaseband0 pol0 (原:东4V)
+  "天线08": 7   # VBaseband0 pol1 (原:东5V) - 与天线05相关性0.43
+  "天线09": 8   # VBaseband1 pol0 (原:东9H)
+  "天线10": 9   # VBaseband1 pol1 (原:东10V)
+  "天线11": 10  # VBaseband2 pol0 (原:东7H)
+  "天线12": 11  # VBaseband2 pol1 (原:东8V)
+
+# 观测参数
+observation:
+  center_freq_mhz: 1355
+  bandwidth_mhz: 250
+  sampling_rate_mhz: 500  # 根据代码中的计算
+  source_name: "Crab"
+  
+# 处理参数
+processing:
+  fft_segments: 32
+  segment_combine: 8  # 每8段合并
+  output_channels: 2048  # 每段FFT点数

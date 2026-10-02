@@ -94,7 +94,7 @@ class DiskSaverRft : public raft::kernel
       VLOG(3) << it->first << std::endl;
     }
     auto imsize = std::get<int>(img_metadata["grid_size"]);
-    auto nchan = std::get<uint8_t>(img_metadata["nchan"]);
+    auto nchan = std::get<int>(img_metadata["nchan"]);
     int chan_width = std::get<int>(img_metadata["chan_width"]);
     auto chan0 = std::get<int64_t>(img_metadata["chan0"]);
     double cfreq = (chan0 + nchan * chan_width / BANDWIDTH * 0.5) * BANDWIDTH *

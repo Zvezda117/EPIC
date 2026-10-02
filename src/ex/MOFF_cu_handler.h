@@ -114,6 +114,9 @@ class MOFFCuHandler {
   bool is_correction_kernel_set{false};
   float* m_correction_grid_d{nullptr};
   bool is_correction_grid_set{false};
+  bool m_remove_autocorr{false};
+  float* m_auto_power_d{nullptr};
+  void ResetAutoCorrPower(int nchan, int grid_size, int support);
   void GetCorrectionKernel(float* p_out_kernel, int p_support_size,
                            int p_nchan);
   void SetCorrectionGrid(float* p_corr_grid, int p_grid_size, int p_nchan);

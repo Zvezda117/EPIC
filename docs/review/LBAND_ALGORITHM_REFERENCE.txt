@@ -1,0 +1,130 @@
+L-band 小阵列算法选择与原始论文依据（2026-10-02，只读研究）
+
+结论与边界
+对于当前10根物理天线、12个有效极化输入、64×64像素、128频道和40/400ms积分，
+应优先把“FX相关并积分 -> 每频道精确三维基线DFT成像”纳入生产候选和参考实现。
+它可在成像前把1000/10000个独立时间样本压为一个小型相关矩阵；当前稀疏阵列不满足“网格点数约等于天线数”的前提。
+逐样本电压DFT适合精确参考、少量定向波束或很短输出间隔；fused MOFF适合保留作实测竞争方案及未来大N/密集阵列。
+这里没有在RTX4090上测量速度，不宣称某个实现绝对最快；需相同科学输出/精度的端到端基准决定。
+已知硬件为双RTX4090，跨SYS/NUMA；本研究没有运行GPU任务。
+
+A. 原始来源（论文与作者代码，直接链接）
+[P1] Thyagarajan et al., A Generic and Efficient E-field Parallel Imaging Correlator for Next-Generation Radio Telescopes, MNRAS 2017.
+     https://arxiv.org/pdf/1510.08318
+     https://academic.oup.com/mnras/article/467/1/715/2917985
+     §2 Eq(1),(4),(5),(11)-(13)：RF传播相位、相关定义、FX/MOFF重排；§4.2：auto footprint；§6.1/Fig11-12：成本适用域。
+[P2] Morales, Enabling Next Generation Dark Energy and Epoch of Reionization Radio Observatories with the MOFF Correlator, 2011.
+     https://arxiv.org/pdf/0812.3669
+     §4 Eq(12a)-(12e)：软件全息与电压成像等价；§6 Eq(17)-(21)：计算量、填充因子界限；§4末/§5：w与频率并行。
+[P3] Kent et al., A Real-Time, All-Sky, High Time Resolution, Direct Imager for the Long Wavelength Array, MNRAS 2019.
+     https://arxiv.org/pdf/1904.11422
+     §2 Eq(3)-(5)：完整w项与实现采用共面近似；§3.3：Romein；§5.2：roofline及比较需包含FX后成像的限定。
+[P4] Krishnan et al., Optimization and Commissioning of the EPIC Commensal Radio Transient Imager for the Long Wavelength Array, MNRAS 2023.
+     https://arxiv.org/pdf/2301.09662
+     §2.2/Fig1：每时刻/频道delay处理；§3.1/VGrid与Fig3：memory access优化；§3.2/Eq(5)/Fig4：XGrid逐像素相关。
+[C1] 作者通用EPIC代码： https://github.com/epic-astronomy/EPIC/tree/c2bd68b792a5269cfffe1d93b4710eae9ba8ca55
+     epic/antenna_array.py:7147-7157 电压FFT后取模平方；:7619-7647 rmfit/mask/none；:12702-12710 aperture自功率。
+[C2] 作者LWA_EPIC： https://github.com/epic-astronomy/LWA_EPIC/tree/44bb9b43cf8a13a39e572e1a721b5e9473faf63f
+     具体历史差异另见同目录 GENERAL_EPIC_COMPARISON.txt；不能由作者身份推断每段历史实现均已正确。
+
+B. 公平比较的共同数学对象（下列为依据[P1-P3]自行展开的离散模型）
+令i=(物理天线a,极化p)，e_i(t,f)为同一真实时间/频率的已校准电压，缺输入用真实mask而非复制。
+令a_i(s,f,t)含噪声权重、方向响应/选定gridding核响应和精确几何相位；Z_p(s,t,f)=Σ_{i∈p} a_i e_i。
+输出为R_pq(s,f)=平均_t[Z_p(s,t,f) conj(Z_q(s,t,f))]。
+若积分窗口内a_i可固定，V_ij(f)=平均_t[e_i conj(e_j)]，则
+  R_pq(s,f)=Σ_{i∈p,j∈q} a_i(s,f) conj(a_j(s,f)) V_ij(f)。
+这对相同样本、相同权重、相同几何和精度，在有限样本下也是代数恒等式，而非只在无限积分才近似成立。
+不同算法的auto选择、FFT符号/归一化、方向响应、flag和有效计数不同，便不能直接比较像素幅度。
+精确voltage DFT直接算Z；MOFF用gridding+FFT近似同一线性算子；FX先计算V，再做上式。
+phase-only DFT不自动等于带aperture/noise weighting的软件全息MOFF，需把同一a_i用于参考模型。
+如任意baseline taper/基线噪声权重不能写成a_i conj(a_j)，单个电压图平方不与该FX权重等价。
+随时间变化的方向相关权重必须逐时刻应用，或分短块相关/成像；基线有效样本数不同时还需一致的flag及归一化契约。
+[P1] Eq(13)及其后说明：随机复电压不能先长时间平均再平方；可以先形成相关/功率后平均。
+
+C. 当前阵列成本推导（计算量，不是GPU耗时；F-engine共同成本单列）
+T=1000对应40ms；T=10000对应400ms；C=128；G=4096；K=25表示5×5 kernel；M=12有效输入。
+实际5个H、7个V；同pol非auto基线10+21=31；H-V有35对，其中2对为同一物理天线的跨pol自相关。
+完整12输入Hermitian相关矩阵只需M(M+1)/2=78个独立复相关量（12个对角及66个交叉项）。
+PAD并不贡献天线数；12有效输入也不是10根天线全双极化的20输入。
+
+步骤/估计单位                                 T=1000              T=10000
+FX三角相关：78*C*T 个complex MAC               9,984,000           99,840,000
+FX积分后DFT图：66*G*C 个pair/pixel项            34,603,008          34,603,008
+两者之和的保守MAC项代理                        44,587,008          134,443,008
+逐时刻voltage DFT：M*G*C*T 个complex MAC        6,291,456,000       62,914,560,000
+MOFF两pol空间FFT：2*5*G*log2(G)*C*T real FLOPs  62,914,560,000      629,145,600,000
+MOFF grid：M*K*C*T 个complex update            38,400,000          384,000,000
+
+FFT行是常用complex FFT real-FLOP粗估，不与complex MAC数量直接比较；DFT一个complex MAC约8 real FLOPs。
+FX图中同pol共轭基线可用2Re项、2个跨pol本地项可特化，表格故意保守；其auto beam项、输出归一化、校准及存储另计。
+MOFF还需格点清零、两pol/四平面相关功率、自相关、correction及reduce；不能只拿FFT数字代表总时间。
+上述计数说明为何长积分的小阵列应在成像前相关/平均，但实际吞吐仍取决于GPU utilization、数据布局和kernel launch。
+若改用FX后UV gridding+一次FFT成像，成本约C*[78*T + baseline*K_baseline + P_img*G logG]，
+长积分可更低，但插值/w/A核的正确性复杂；当前只有几十条基线，直接精确DFT实现简单且可带完整三维相位。
+DFT矩阵可预计算：M*G*C complex64约50,331,648 bytes；phase center/频率/beam变化时重算，避免每样本重复sin/cos。
+
+输出间隔改变最优选择：T=1时FX像素基线项约66G、voltage DFT约12G，DFT电压可能更合算；
+以简单项计数求78T+66G≈12GT，G4096时交叉点约T=5.51，即约0.22ms，
+这只是运算数提示，未含kernel/吞吐/auto/beam，不是实际RTX4090的切换阈值。
+目标仅是少量源/几个像素时，定向电压beamforming约M*Nbeam*C*T，可远小于整张图。
+
+D. 论文为何不能给当前阵列“MOFF普适最快”的背书
+[P2] §6 Eq(17) FX∝B*Na²；Eq(18) MOFF∝c*B*Ng*log2(sqrt(Ng))；Eq(19)-(21)给填充因子适用界限，且指出稀疏阵列FX更优。
+[P1] §6.1对照约β*(4Ng)*log2(4Ng)与Na(Na−1)/2；4来自其零填充，β依实现；表格并非当前CUDA实现的精确运行时间。
+此处以给定实际64² FFT比较，G=4096；若采用额外2倍各轴padding，FFT代价和内存还会增加。
+当前10根物理天线/4096格点非常稀疏；单有“MOFF O(N logN)”口号把Ng替换成Na是不成立的。
+[P3] §5.2指出其EPIC实现memory-bound，并提醒FX roofline尚不含成像；本报告的FX候选已把积分后成像纳入计数。
+[P4] §3.1/3.2主要是VGrid/XGrid访问/资源优化，并不是给任意小阵列或RTX4090的普适最快结果。
+新GPU的compute性能提升不必然解决grid/FFT的内存和启动成本；当前应量测，不外推旧GTX980/2080Ti数字。
+
+E. 正确自相关模型（自行由B节展开，依据[P1] §4.2及[C1]）
+若要去“物理天线自身”而保留非同天线相关，应对所有pq扣
+  A_pq(s,f)=Σ_a a_ap(s,f) conj(a_aq(s,f)) V_ap,aq(f)。
+p=q：Σ_a |a_ap|² * 平均|e_ap|²；p≠q：仅实际同时具备两个极化的天线贡献。
+当前XY自项有东4/东5两根，不能将12输入矩阵对角去掉就误称所有物理天线自项已去掉。
+校准乘复增益g之后，auto必须用|g|²；跨pol为gX conj(gY)，不能用|g|或只乘一个未平方gain。
+对逐天线gridding核k_a，图像auto响应是|F(k_a)|²，UV footprint是k_a与其反向共轭的相关。
+单次F(P_a*k_a)一般不是auto功率响应；不同kernel时也不能用|F(kernel_avg)|²代替Σ P_a|F(k_a)|²。
+若所有有效天线核确实相同，则共同beam因子可提出；其适用条件和归一化应显式记录。
+是否保留auto属于科学输出定义；去auto并非MOFF核心算法的必要步骤。[P1] §4.2为对比FX而去auto。
+最小验收：单天线keep-auto正功率、remove-auto零；两天线已知相位条纹；公共电压相位旋转不改变相关；
+复杂增益幅度0.5的auto缩为0.25；不同kernel/缺pol/flag时与显式基线求和一致。
+
+F. L-band相位中心、完整三维几何和w项（[P1] Eq1/4；[P3] Eq3-5）
+在论文的入射相位约定e_a∝exp(-2πi*fRF*r_a·s/c)下，先用
+  e'_a=e_a*exp(+2πi*fRF*r_a·s0/c)
+跟踪真实目标方向s0，再用exp(+2πi*fRF*r_a·(s−s0)/c)成像；设备IQ/旁带约定改变时须统一重推符号。
+必须是实际RF频率：fRF=fLO+已确认旁带符号*有符号基带频率，不能只用FFT索引0..Fs或只用fbaseband修几何。
+ENU/ITRF、真实UTC、实际指向、天线高度、仪器delay/phase/beam必须明确；source_name或FITS标注不会改变电压相位。
+转到目标的u/v/w基底后，相位为2π*(u*l+v*m+w*(sqrt(1−l²−m²)−1))，uvw以波长计。
+精确voltage DFT/FX+DFT可直接包含这项；2D FFT需w-projection、w-stacking/多个高度层或经验证的小视场近似。
+[P3] §2 Eq(3)-(5)明确从完整表达式转为其共面实现；理论允许w修正，不代表现有LWA核已经做了。
+忽略w的误差界约|δφ|≈π*|w|*θ²；建议按要求设εφ，再验证π|w|max*θmax²≤εφ，而不是只检查地面Z/U差。
+1355MHz的λ≈0.221249m；1.28°方形场的半边0.64°、角点θ≈0.905°；仅17m高度对应约0.0602rad角点残差。
+更换phase center后，w还包含数百米水平基线在视线方向的投影，可能远大于17m，需使用真实目标和UTC计算。
+高约束L-band小阵列用精确DFT几何比盲目扩大MOFF核或忽略w更容易建立正确性基线。
+40/400ms积分时可用中点uvw只在已评估时间smearing范围内；较长积分需分块/跟踪；频道平均也要评估bandwidth smearing。
+全250MHz的分数带宽约18.45%，不能把所有频道当1355MHz共同波长；每频道的phase/uvw/beam应与RF频率一致。
+
+G. 250MHz原始带宽、数据量和双GPU调度（均为当前参数自行计算）
+25kHz解析度覆盖250MHz需要10,000频道；当前128频道仅3.2MHz、原始带宽的1.28%，不是全带宽算法成功。
+同分辨率全带宽的X/图像工作量约扩大10,000/128=78.125倍；DC mask、RFI flag可跳过，但有效带宽要记录。
+12路int8 IQ、250MS/s原始输入率约6GB/s；所有算法共同承担解包、对齐和F-engine，不能仅比较成像kernel吞吐。
+若全批保留T1000×C128×G4096×2pol complex64空间电压格点，约8.389GB；T10000约83.89GB。
+因此应tile/fuse/reduce，而不是持有全部时间-频率图像；FX平均矩阵只有78*C complex量，体积极小。
+输出128频道、4个float32平面、4096像素：40ms帧约209.7MB/s；FX三角complex64约2.00MB/s。
+全10,000频道时分别约16.384GB/s与156MB/s；400ms输出率为上述十分之一。
+对这个小阵列，直接image输出比visibility更大；论文“MOFF低输出率”依赖Ng≈Na的dense情形，不适用于当前G≫M²。
+以上为未做频率合并的科学产品；实际chan_nbin会减少成图输出，但不得错误合并频率坐标或复电压。
+双GPU优先按独立频段分工，每块有全有效天线；避免SYS链路上的逐时刻跨GPU电压grid/FFT通信。
+用各自NUMA局部pinned ring/buffer、批量异步传输与处理；小128频道也要测1GPU是否更快，不能默认双卡必然翻倍。
+
+H. 可交给GPU实施者的最小共同基准
+1) 固定输入：12有效complex电压+10根物理天线映射+RF/UTC；T1000/10000,C128,G64²，另有带mask测试。
+2) 精确CPU/FP64的三维voltage DFT与FX+DFT先验证同一R和相同physical-auto模式；中小T可逐像素比较。
+3) GPU候选：fused MOFF、tiled voltage DFT、tiled FX+DFT；记录精度、auto语义、核响应与FFT scale，统一reference。
+4) 比较端到端解包/F-engine/传输/成像/写出、单GPU/双GPU、时间和频率tile；预热后多次统计，禁止以仅X-engine时间代替总流程。
+5) 先FP32计算/累加建立科学基线；FP16/BF16/Tensor Core或CNib4量化仅在动态范围、相位、flux/噪声预算独立验收后使用。
+6) 根据实测吞吐及科学误差选择算法；当前成本推导支持FX+精确DFT优先，但不代替GPU测量。
+
+研究范围：只读取论文和作者代码，成本算术用CPU验证；没有修改生产源码、处理大原始文件或占用GPU。

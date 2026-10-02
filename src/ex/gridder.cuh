@@ -487,7 +487,7 @@ template <
 __device__ inline void DualPolEpicHalfGridder(
     cg::thread_block tb, const InDtype* f_eng, const float3* __restrict__ antpos,
     const float4* __restrict__ phases, typename FFT::value_type* smem,
-    float* gcf_grid_elem, ImageDiv Div, ACorrType acorr) {
+    float* gcf_grid_elem, ImageDiv Div, ACorrType acorr, int channel_idx) {
   // auto tb = cg::this_thread_block();
   constexpr int nelements = Support * Support;
   constexpr float inv_nelements = 1.f / float(nelements);
@@ -508,8 +508,6 @@ __device__ inline void DualPolEpicHalfGridder(
   if (this_thread_ant >= nants_per_pass) {  // cannot grid with these threads
     return;
   }
-  int channel_idx = blockIdx.x;
-
   for (int ant = this_thread_ant; ant < NStands; ant += nants_per_pass) {
     typename FFT::value_type temp_data;
     temp_data = __half2half2(0);
@@ -533,7 +531,8 @@ __device__ inline void DualPolEpicHalfGridder(
         (Div == LOWER && ypix < half_grid)) {
       continue;
     }
-    if (xpix < 0 || xpix >= size_of<FFT>::value) {
+    if (xpix < 0 || xpix >= size_of<FFT>::value ||
+        ypix < 0 || ypix >= size_of<FFT>::value) {
       continue;
     }
 
@@ -600,7 +599,7 @@ __device__ inline void DualPolEpicFullGridder(cg::thread_block tb,
     const float4* __restrict__ phases,
     typename FFT::value_type* shared_mem,
     typename FFT::value_type (&thread_data)[FFT::elements_per_thread],
-    float* gcf_grid_elem, ACorrType acorr){
+    float* gcf_grid_elem, ACorrType acorr, int channel_idx){
       auto HalfGridder = DualPolEpicHalfGridder<FFT,Support, NStands, InDtype>;
       constexpr int stride = size_of<FFT>::value / FFT::elements_per_thread;
   constexpr int row_size =
@@ -613,7 +612,7 @@ __device__ inline void DualPolEpicFullGridder(cg::thread_block tb,
         phases,
         shared_mem,
         //  gcf_tex,
-        gcf_grid_elem, UPPER, acorr);
+        gcf_grid_elem, UPPER, acorr, channel_idx);
 
     tb.sync();
 
@@ -624,11 +623,13 @@ __device__ inline void DualPolEpicFullGridder(cg::thread_block tb,
       auto index = (threadIdx.x + _reg * stride) + threadIdx.y * row_size;
       thread_data[_reg] = shared_mem[index];
     }
+    tb.sync();  // All upper-half reads must finish before reusing shared memory.
 
     for (int i = tb.thread_rank();
          i < size_of<FFT>::value * size_of<FFT>::value / 2; i += tb.size()) {
       shared_mem[i] = __half2half2(0);
     }
+    tb.sync();  // Clearing must finish before any lower-half atomic addition.
 
     HalfGridder(
         tb,
@@ -638,7 +639,7 @@ __device__ inline void DualPolEpicFullGridder(cg::thread_block tb,
         phases,
         shared_mem,
         //  gcf_tex,
-        gcf_grid_elem, LOWER, acorr);
+        gcf_grid_elem, LOWER, acorr, channel_idx);
 
     tb.sync();
 

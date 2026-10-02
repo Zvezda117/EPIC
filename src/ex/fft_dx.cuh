@@ -88,6 +88,70 @@ void __device__ Fft2D(cg::thread_block tb, typename FFT::value_type (&thread_dat
   tb.sync();
 }
 
+// Removing the analytic self power exposes cancellation errors in the half
+// FFT, even when products are accumulated in float. Use float transforms for
+// that path, preserving the half voltage grid and its original 1/64 scaling.
+// One polarization at a time has the same block and shared-memory layout as
+// the packed two-polarization half FFT; both float outputs stay in registers.
+template<class FFT>
+using AutoPrecisionFFT = decltype(Size<size_of<FFT>::value>() + Precision<float>() +
+    Type<fft_type::c2c>() + Direction<fft_direction::inverse>() + SM<890>() +
+    ElementsPerThread<FFT::elements_per_thread>() +
+    FFTsPerBlock<size_of<FFT>::value>() + Block());
+
+template<class FFT>
+__device__ void Fft2DFloatPol(cg::thread_block tb,
+    const typename FFT::value_type (&input)[FFT::elements_per_thread],
+    typename AutoPrecisionFFT<FFT>::value_type (&output)[FFT::elements_per_thread],
+    typename FFT::value_type* shared_mem, bool y_pol) {
+  using FloatFFT = AutoPrecisionFFT<FFT>;
+  static_assert(FloatFFT::block_dim.x == FFT::block_dim.x &&
+                FloatFFT::block_dim.y == FFT::block_dim.y,
+                "Float self-removal transform must preserve the imaging block");
+  static_assert(FloatFFT::shared_memory_size <= FFT::shared_memory_size,
+                "Float transform must fit the existing FFT workspace");
+  constexpr int n = size_of<FFT>::value;
+  constexpr int stride = n / FFT::elements_per_thread;
+  auto* work = reinterpret_cast<typename FloatFFT::value_type*>(shared_mem);
+  for (int r=0; r<FFT::elements_per_thread; ++r) {
+    output[r].x = float(y_pol ? input[r].x.y : input[r].x.x);
+    output[r].y = float(y_pol ? input[r].y.y : input[r].y.x);
+  }
+  FloatFFT().execute(output, work);
+  tb.sync();
+  // Independent float triangular transpose, with barriers before every reuse.
+  for (int r=0; r<FFT::elements_per_thread; ++r) {
+    const int col = threadIdx.x + r * stride;
+    if (col > threadIdx.y) {
+      const int i = threadIdx.y*n + col - (threadIdx.y+1)*(threadIdx.y+2)/2;
+      work[i] = output[r];
+    }
+  }
+  tb.sync();
+  for (int r=0; r<FFT::elements_per_thread; ++r) {
+    const int col = threadIdx.x + r * stride;
+    if (threadIdx.y > col) {
+      const int i = col*n + threadIdx.y - (col+1)*(col+2)/2;
+      const auto old = output[r];
+      output[r] = work[i];
+      work[i] = old;
+    }
+  }
+  tb.sync();
+  for (int r=0; r<FFT::elements_per_thread; ++r) {
+    const int col = threadIdx.x + r * stride;
+    if (col > threadIdx.y) {
+      const int i = threadIdx.y*n + col - (threadIdx.y+1)*(threadIdx.y+2)/2;
+      output[r] = work[i];
+    }
+    output[r].x *= 1.0f/64.0f;
+    output[r].y *= 1.0f/64.0f;
+  }
+  tb.sync();
+  FloatFFT().execute(output, work);
+  tb.sync();
+}
+
 /**
  * @brief Block fft specialization for half precision
  *
@@ -136,12 +200,13 @@ __launch_bounds__(FFT::max_threads_per_block) __global__
                           float* output_g, int chan_offset = 0,
                           bool is_first_gulp = true,
                           float* gcf_grid_elem = nullptr,
-                          float* gcf_correction_grid = nullptr) {
+                          float* gcf_correction_grid = nullptr,
+                          bool remove_autocorr = false,
+                          const float* auto_power = nullptr) {
   using complex_type = typename FFT::value_type;
   extern __shared__ complex_type shared_mem[];
 
   auto VoltageGridderF = DualPolEpicFullGridder<FFT, support, LWA_SV_NSTANDS>;
-  auto AutoCorrGridderF = DualPolEpicFullGridder<FFT, support, LWA_SV_NSTANDS,float4>;
   auto AcorrAccumulatorF = AccumAutoCorrs<FFT, LWA_SV_NSTANDS>;
 
   // constexpr int fft_steps = 2;  // row-wise followed by column-wise
@@ -201,6 +266,7 @@ __launch_bounds__(FFT::max_threads_per_block) __global__
       thread_data[_reg] = __half2half2(0);
     }
 
+    tb.sync();  // Grid atomics may start only after every warp cleared its region.
     VoltageGridderF(tb,
         reinterpret_cast<const CNib2*>(GetFEngSample<Order>(
             f_eng_g, seq_no, channel_idx, nseq_per_gulp, nchan)),
@@ -209,17 +275,32 @@ __launch_bounds__(FFT::max_threads_per_block) __global__
         reinterpret_cast<const float4*>(GetPhases(phases_g, channel_idx)),
         shared_mem,
         thread_data,
-        gcf_grid_elem, NONE);
+        gcf_grid_elem, NONE, channel_idx);
 
     tb.sync();
 
     // Accumulate auto corrs
-    AcorrAccumulatorF(tb,
+    if (remove_autocorr) AcorrAccumulatorF(tb,
       reinterpret_cast<const CNib2*>(GetFEngSample<Order>(
               f_eng_g, seq_no, channel_idx, nseq_per_gulp, nchan)),
       auto_corrs);
 
 
+    if (remove_autocorr) {
+      typename AutoPrecisionFFT<FFT>::value_type fx[FFT::elements_per_thread];
+      typename AutoPrecisionFFT<FFT>::value_type fy[FFT::elements_per_thread];
+      Fft2DFloatPol<FFT>(tb, thread_data, fx, shared_mem, false);
+      Fft2DFloatPol<FFT>(tb, thread_data, fy, shared_mem, true);
+      for (int r=0; r<FFT::elements_per_thread; ++r) {
+        const float mult = float(row_size);
+        const float xx = fx[r].x*fx[r].x + fx[r].y*fx[r].y;
+        const float yy = fy[r].x*fy[r].x + fy[r].y*fy[r].y;
+        const float re = fx[r].x*fy[r].x + fx[r].y*fy[r].y;
+        const float im = fx[r].y*fy[r].x - fx[r].x*fy[r].y;
+        stokes_xx_yy[r] += accum_oc_t{_accum_t(xx*mult), _accum_t(yy*mult)};
+        stokes_U_V[r] += accum_oc_t{_accum_t(re*mult), _accum_t(im*mult)};
+      }
+    } else {
     Fft2D<FFT>(tb, thread_data, shared_mem,false /*fftshift*/);
 
     // Accumulate cross-pols using on-chip memory.
@@ -238,31 +319,34 @@ __launch_bounds__(FFT::max_threads_per_block) __global__
       stokes_xx_yy[_reg] += accum_oc_t{xx*mult, yy*mult};
       stokes_U_V[_reg] += accum_oc_t{uu*mult, vv*mult};
     }
+    }
 
     
     tb.sync();
   }  // End of gulp loop
- // reset registers and shared mem
-  for (int i = tb.thread_rank();
-         i < size_of<FFT>::value * size_of<FFT>::value / 2; i += tb.size()) {
-      shared_mem[i] = __half2half2(0);
+  // Autocorrelation is a power response, not an FFT of the raw powers.
+  // Responses are precomputed per antenna/channel/pixel from the *same*
+  // voltage gridding kernel. Fft2D scales voltage by 1/64; products by N.
+  if (remove_autocorr) {
+    assert(auto_power != nullptr);
+    const auto* gains = reinterpret_cast<const float4*>(GetPhases(phases_g, channel_idx));
+    for (int r = 0; r < FFT::elements_per_thread; ++r) {
+      const int pixel = threadIdx.x + r * stride + threadIdx.y * row_size;
+      float4 self = {0, 0, 0, 0};
+      for (int ant = 0; ant < LWA_SV_NSTANDS; ++ant) {
+        const float w = auto_power[(channel_idx * LWA_SV_NSTANDS + ant) * row_size * row_size + pixel]
+                        * (float(row_size) / (64.0f * 64.0f));
+        const float4 g = gains[ant], a = auto_corrs[ant];
+        const float gr = g.x * g.z + g.y * g.w;
+        const float gi = g.y * g.z - g.x * g.w;
+        self.x += w * a.x * (g.x * g.x + g.y * g.y);
+        self.y += w * a.y * (g.z * g.z + g.w * g.w);
+        self.z += w * (a.z * gr - a.w * gi);
+        self.w += w * (a.z * gi + a.w * gr);
+      }
+      stokes_xx_yy[r] += accum_oc_t{-_accum_t(self.x), -_accum_t(self.y)};
+      stokes_U_V[r] += accum_oc_t{-_accum_t(self.z), -_accum_t(self.w)};
     }
-    for (int _reg = 0; _reg < FFT::elements_per_thread; ++_reg) {
-      thread_data[_reg] = __half2half2(0);
-    }
-  // calculate the XX* and YY* auto-corrs in two independent FFTs
-  AutoCorrGridderF(tb,auto_corrs, antpos_smem,
-        reinterpret_cast<const float4*>(GetPhases(phases_g, channel_idx)),
-        shared_mem,
-        thread_data,
-        gcf_grid_elem, XX_YY);
-  tb.sync();
-  Fft2D<FFT>(tb, thread_data, shared_mem,true);
-  tb.sync();
-  for (int _reg = 0; _reg < FFT::elements_per_thread; ++_reg) {
-    // remove XX* and YY* autocorrs
-    stokes_xx_yy[_reg] += accum_oc_t{-_accum_t(__habs(thread_data[_reg].x.x)) * _accum_t(row_size*row_size), -_accum_t(__habs(thread_data[_reg].x.y))*_accum_t(row_size*row_size)};
-    // stokes_xx_yy[_reg] -= thread_data[_reg].x.y;
   }
 
   // Write the final accumulated image into global memory

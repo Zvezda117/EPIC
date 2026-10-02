@@ -28,6 +28,8 @@
 #include <any>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -88,6 +90,19 @@ struct MOFFCorrelatorDesc {
   int max_tries_acq_buf{5};
   int kernel_oversampling_factor{2};
   bool use_bf16_accum{false};
+
+  // AlignedBuffer<float> takes elements, not bytes. Derive the allocation
+  // from the same dimensions used by the CUDA output rather than buf_size.
+  size_t OutputBufferElements() const {
+    if ((img_size != HALF && img_size != FULL) || nchan_out <= 0) {
+      throw std::invalid_argument("Invalid output image dimensions");
+    }
+    const size_t pixels = size_t(img_size) * size_t(img_size) * 4;
+    if (size_t(nchan_out) > std::numeric_limits<size_t>::max() / pixels / sizeof(float)) {
+      throw std::overflow_error("Output image allocation overflow");
+    }
+    return pixels * size_t(nchan_out);
+  }
 };
 
 struct OutImgDesc {
