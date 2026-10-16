@@ -75,3 +75,12 @@ Existing historical FITS images are unchanged and are not retroactively correcte
 
 GPU access in this managed session requires execution outside the filesystem sandbox.
 Earlier reports of no CUDA devices described sandbox visibility, not missing hardware.
+
+## 2026-10-16: raw Crab observation model
+
+Packet integrity checks, chunk epoch offsets, explicit UTC/site/ICRS geometry and
+per-window raw tracking are now implemented and tested on both GPUs. See
+[Crab observation-model repair](CRAB_OBSERVATION_REPAIR.md). Real-data scientific
+validation remains blocked by the missing 9178 acquisition record, undocumented
+header-clock semantics and inconsistent antenna coordinate columns. Earlier
+zenith-centered diagnostic images are not a Crab-centered sky map.

@@ -176,3 +176,11 @@ The positions and voltages were synthetic, and this measured availability-count
 model is not an observation result. Details are saved in
 `src/fx/API_BENCHMARK.json`; this API measurement is distinct from the earlier
 single-polarization resident-compute microbenchmark and proves no two-GPU speedup.
+
+## Time-dependent astronomical pointing
+
+For raw voltages with a confirmed first-sample epoch and surveyed local ENU
+positions, `--sky-config` now generates a source-centered SIN grid and updates
+steering each window. See [Crab observation-model repair](CRAB_OBSERVATION_REPAIR.md)
+for the JSON contract, Earth-orientation data, validation and unresolved 9178
+metadata. A successful numerical run alone does not establish a Crab detection.

@@ -20,10 +20,15 @@ from __future__ import annotations
 
 import argparse
 import math
+import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/python"))
+from packet9178 import audit_file, audit_group, chunk_epoch
 
 
 PACKET_BYTES = 262400
@@ -118,6 +123,8 @@ def read_terminal_channel(
             f"but file has {file_packets} packets"
         )
 
+    audit_file(path, first_packet, packets_needed)
+
     mm = np.memmap(
         path,
         mode="r",
@@ -198,6 +205,7 @@ def build_epic_gulp(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
     start_sample = args.start_seq * SEQ_SAMPLES
 
     selections = EPIC4_INPUTS if args.array_mode == "epic4" else FULL10_INPUTS
+    args.packet_audit = audit_group(sorted({data_dir / item.filename for item in selections}))
     if args.array_mode == "epic4":
         nstands = 4
     elif args.array_mode == "full10":
@@ -249,7 +257,7 @@ def build_epic_gulp(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
 
     center_chan = int(round(args.center_freq_mhz * 1e6 / EPIC_CHAN_BW_HZ))
     chan0 = center_chan - args.channels // 2 + args.channel_offset
-    meta = np.array([args.tstart, chan0], dtype=np.float64)
+    meta = np.array([chunk_epoch(args.tstart, args.start_packet, args.start_seq), chan0], dtype=np.float64)
     return epic, meta
 
 
@@ -314,7 +322,7 @@ def parse_args() -> argparse.Namespace:
         help="Use a fixed linear scale before signed 4-bit CNib clipping",
     )
     parser.set_defaults(quantize_cnib=True)
-    parser.add_argument("--tstart", type=float, default=0.0)
+    parser.add_argument("--tstart", type=float, default=0.0, help="Confirmed Unix UTC of sample 0 in each input file; 0 means unknown. Packet/sequence offsets are added.")
     parser.add_argument(
         "--no-compress",
         dest="compress",
@@ -331,7 +339,7 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     save_npz = np.savez_compressed if args.compress else np.savez
-    save_npz(output, data=epic, meta=meta)
+    save_npz(output, data=epic, meta=meta, packet_audit_json=np.asarray(json.dumps(args.packet_audit, ensure_ascii=False)))
     print(f"Saved {output}")
     print(f"  data shape: {epic.shape}, dtype: {epic.dtype}")
     print(f"  meta: tstart={meta[0]}, chan0={int(meta[1])}")
