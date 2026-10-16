@@ -12,6 +12,8 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/python"))
 from tqdm import tqdm
 
 # ═══════════════════════════════════════════════════════════════
@@ -45,9 +47,11 @@ def load_antenna_positions_from_csv():
             row['ITRF_Z']
         ])
     
-    # 站点位置（取平均）
-    station_lat = df['latitude'].mean()
-    station_lon = df['longitude'].mean()
+    # Station frame must come from the same authoritative ITRF positions.
+    from array_geometry import load_itrf_array
+    geometry = load_itrf_array(csv_file, list(positions))
+    station_lat = geometry['site_lat_deg']
+    station_lon = geometry['site_lon_deg']
     
     return positions, station_lat, station_lon
 

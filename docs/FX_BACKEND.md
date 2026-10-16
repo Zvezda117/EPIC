@@ -184,3 +184,7 @@ positions, `--sky-config` now generates a source-centered SIN grid and updates
 steering each window. See [Crab observation-model repair](CRAB_OBSERVATION_REPAIR.md)
 for the JSON contract, Earth-orientation data, validation and unresolved 9178
 metadata. A successful numerical run alone does not establish a Crab detection.
+
+For the user-confirmed ITRF coordinate authority, build geometry with
+`scripts/build_itrf_geometry.py`; the runner validates/adopts its ENU reference
+site. See [ITRF geometry](ITRF_GEOMETRY.md).

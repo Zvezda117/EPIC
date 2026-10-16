@@ -80,44 +80,24 @@ def _load_custom_array(expected_nstands=None):
     if not index_map:
         return None
 
-    ordered = sorted(index_map.items(), key=lambda item: int(item[1]))
-    if expected_nstands is not None and len(ordered) != int(expected_nstands):
+    from array_geometry import load_itrf_array, ordered_antenna_names, geometry_metadata
+    names = ordered_antenna_names(index_map)
+    if expected_nstands is not None and len(names) != int(expected_nstands):
         raise RuntimeError(
-            f"{mapping_path.name} defines {len(ordered)} stands, but this EPIC "
+            f"{mapping_path.name} defines {len(names)} stands, but this EPIC "
             f"binary was compiled for {expected_nstands}. Rebuild with matching "
             "LWA_SV_NSTANDS or select a matching EPIC_ARRAY_CONFIG."
         )
-
-    rows = _load_coordinate_rows(coord_path)
-    names = [name for name, _ in ordered]
-    missing = [name for name in names if name not in rows and not name.startswith("PAD")]
-    if missing:
-        raise RuntimeError(
-            f"{coord_path.name} has no coordinates for: {', '.join(missing)}"
-        )
-
-    positions = []
-    lon_vals = []
-    lat_vals = []
-    for name in names:
-        if name.startswith("PAD"):
-            positions.append([0.0, 0.0, 0.0])
-            continue
-        row = rows[name]
-        positions.append(
-            [float(row["X/E"]), float(row["Y/N"]), float(row.get("Z/U", 0.0))]
-        )
-        if row.get("longitude") and row.get("latitude"):
-            lon_vals.append(float(row["longitude"]))
-            lat_vals.append(float(row["latitude"]))
-
+    geometry = load_itrf_array(coord_path, names)
     obs = mapping.get("observation", {})
     return {
         "name": mapping.get("station", {}).get("name", mapping_path.stem),
-        "positions": np.asarray(positions, dtype=np.double),
+        "positions": geometry["positions_m"],
         "antenna_names": names,
-        "lon_deg": float(np.mean(lon_vals)) if lon_vals else None,
-        "lat_deg": float(np.mean(lat_vals)) if lat_vals else None,
+        "lon_deg": geometry["site_lon_deg"],
+        "lat_deg": geometry["site_lat_deg"],
+        "height_m": geometry["site_height_m"],
+        "geometry_metadata": geometry_metadata(geometry),
         "center_freq_mhz": obs.get("center_freq_mhz"),
     }
 

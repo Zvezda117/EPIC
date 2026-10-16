@@ -41,6 +41,7 @@ def main():
     if not np.isfinite(data).all():
         raise ValueError('input data must be finite')
     with np.load(args.geometry, allow_pickle=False) as geometry:
+        geometry_metadata = json.loads(str(geometry['geometry_metadata_json'])) if 'geometry_metadata_json' in geometry else {}
         pos = np.asarray(geometry['positions_m'], dtype=np.float64)
         freq = np.asarray(geometry['frequencies_hz'], dtype=np.float64)
         if not args.sky_config:
@@ -58,6 +59,14 @@ def main():
         sky_config = json.loads(args.sky_config.read_text())
         if sky_config.get('iers_file'):
             sky_config['iers_file'] = str((args.sky_config.parent / sky_config['iers_file']).resolve())
+        if geometry_metadata.get('coordinate_authority') == 'ITRF_X/Y/Z':
+            if geometry_metadata.get('coordinate_frame') != 'local_ENU':
+                raise ValueError('ITRF-derived geometry must declare its local_ENU reference')
+            for key, tolerance in [('site_lon_deg', 1e-9), ('site_lat_deg', 1e-9), ('site_height_m', 1e-3)]:
+                reference = float(geometry_metadata[key])
+                if key in sky_config and not np.isclose(float(sky_config[key]), reference, atol=tolerance, rtol=0):
+                    raise ValueError(f'{key} conflicts with the geometry ENU reference; use the ITRF-derived site')
+                sky_config[key] = reference
         sky = SkyModel(sky_config, pos, freq)
         dirs, center, _ = sky.window(0, min(args.window_sequences, t))
         last = ((t-1)//args.window_sequences)*args.window_sequences
@@ -80,7 +89,8 @@ def main():
                     iq_convention=args.iq_convention, voltage_convention=args.voltage_convention,
                     steering='exp(+2*pi*i*f*r_dot_(s-s0)/c)',
                     raw_tracking_gain='exp(+2*pi*i*f*r_dot_s0/c)' if args.voltage_convention == 'raw' else 'none',
-                    gain_convention='voltage_multiply', remove_physical_autocorr=args.remove_autocorr)
+                    gain_convention='voltage_multiply', remove_physical_autocorr=args.remove_autocorr,
+                    geometry_provenance=geometry_metadata)
     if sky is not None:
         metadata.update(time_basis='explicit_first_sample_UTC', sky_config=sky_config,
                         calibration_status='only_caller_supplied_gains; no_instrumental_calibration_inferred')

@@ -82,5 +82,7 @@ Packet integrity checks, chunk epoch offsets, explicit UTC/site/ICRS geometry an
 per-window raw tracking are now implemented and tested on both GPUs. See
 [Crab observation-model repair](CRAB_OBSERVATION_REPAIR.md). Real-data scientific
 validation remains blocked by the missing 9178 acquisition record, undocumented
-header-clock semantics and inconsistent antenna coordinate columns. Earlier
+header-clock semantics. The user subsequently selected ITRF as authoritative;
+[ITRF-derived ENU geometry](ITRF_GEOMETRY.md) now resolves the conflicting coordinate
+columns for runtime use. Earlier
 zenith-centered diagnostic images are not a Crab-centered sky map.

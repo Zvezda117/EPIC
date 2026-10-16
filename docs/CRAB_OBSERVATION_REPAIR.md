@@ -1,5 +1,10 @@
 # Crab observation-model repair — 2026-10-16
 
+**Subsequent user decision:** ITRF_X/Y/Z is authoritative. Runtime geometry and
+station location have been switched to ITRF-derived ENU; see
+[ITRF geometry](ITRF_GEOMETRY.md). The coordinate comparison below records the
+earlier audit, not an unresolved choice of coordinate source.
+
 This stage repairs the contracts around the validated FX numerical backend. It does
 **not** establish a Crab detection or calibrate the instrument. The user confirmed
 Crab, uncompensated raw voltages, and Beijing time for the acquisition records.
@@ -113,7 +118,7 @@ verified ENU survey. Original survey CRS/units/orientation and antenna/channel
 mapping must be verified before a science-grade sky map.
 
 Remaining work: recover the 9178 acquisition record and hardware time semantics;
-verify sample rate/RF/channel sign/shared clock; reconcile the antenna survey;
+verify sample rate/RF/channel sign/shared clock; use the authoritative ITRF geometry;
 estimate instrument delays and gains from suitable calibration data; then rerun
 raw channelization and sky tracking. A sparse array's dirty image will still have
 strong sidelobes and an extended Crab need not appear as a single point source.

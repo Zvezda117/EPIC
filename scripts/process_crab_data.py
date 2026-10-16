@@ -15,6 +15,7 @@ import yaml
 import numpy as np
 import h5py
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/python"))
 from multiprocessing import Pool, cpu_count
 import argparse
 from datetime import datetime
@@ -54,25 +55,9 @@ class CrabDataProcessor:
         从CSV读取天线坐标
         返回：(nstands, 3) 数组，按antenna_index排序
         """
-        import pandas as pd
-        df = pd.read_csv(coord_file)
-        
-        positions = np.zeros((self.nstands, 3))
-        for ant_name, idx in self.antenna_index.items():
-            row = df[df['名称'] == ant_name]
-            if len(row) == 0:
-                print(f"Warning: {ant_name} not found in coordinates")
-                continue
-            # 使用相对坐标 (X/E, Y/N, Z/U)
-            positions[idx] = [
-                row['X/E'].values[0],
-                row['Y/N'].values[0],
-                row['Z/U'].values[0]
-            ]
-        
-        # 转换为相对于第一个天线的位置（米）
-        positions -= positions[0]
-        return positions
+        from array_geometry import load_itrf_array, ordered_antenna_names
+        names = ordered_antenna_names(self.antenna_index)
+        return load_itrf_array(coord_file, names)['positions_m']
     
     def get_antenna_phases(self, positions, freq_hz):
         """

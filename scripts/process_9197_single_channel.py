@@ -13,6 +13,7 @@ import sys
 import yaml
 import numpy as np
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/python"))
 import argparse
 
 try:
@@ -130,9 +131,14 @@ class SimpleDataProcessor:
             "北6": "VBaseband2Spec2"
         }
         
-        # 处理每个天线
+        from array_geometry import ordered_antenna_names
+        names = ordered_antenna_names(self.config['antenna_to_epic_index'])
+        if len(names) != self.nstands or any(name not in antenna_files for name in names):
+            raise ValueError('unsupported antenna mapping for the 9197 single-channel reader')
+        # Use one mapping for voltage placement and ITRF geometry.
         antenna_data = {}
-        for ant_name, file_pattern in antenna_files.items():
+        for ant_name in names:
+            file_pattern = antenna_files[ant_name]
             print(f"\n### Processing {ant_name} ({file_pattern}) ###")
             try:
                 data = self.process_antenna_group(
@@ -159,8 +165,8 @@ class SimpleDataProcessor:
         nsamples = min_length
         voltages = np.zeros((nsamples, 1, self.nstands, 1), dtype=np.complex64)
         
-        # 按顺序填充（北3, 4, 5, 6 → 索引0, 1, 2, 3）
-        for i, ant_name in enumerate(["北3", "北4", "北5", "北6"]):
+        # 按配置索引填充，与坐标顺序一致。
+        for i, ant_name in enumerate(names):
             if ant_name in antenna_data:
                 voltages[:, 0, i, 0] = antenna_data[ant_name][:nsamples]
                 print(f"  Filled {ant_name} → stand {i}")
@@ -194,28 +200,11 @@ class SimpleDataProcessor:
     
     def get_antenna_positions(self):
         """读取天线位置"""
-        import pandas as pd
-        
-        coord_file = 'antenna_coordinates.csv'
-        if not os.path.exists(coord_file):
-            print("Warning: antenna_coordinates.csv not found, using zeros")
-            return np.zeros((self.nstands, 3))
-        
-        df = pd.read_csv(coord_file)
-        
-        positions = np.zeros((self.nstands, 3))
-        for i, ant_name in enumerate(["北3", "北4", "北5", "北6"]):
-            row = df[df['名称'] == ant_name]
-            if len(row) > 0:
-                positions[i] = [
-                    row['X/E'].values[0],
-                    row['Y/N'].values[0],
-                    row['Z/U'].values[0]
-                ]
-        
-        # 相对位置
-        positions -= positions[0]
-        return positions
+        from array_geometry import load_itrf_array, ordered_antenna_names
+        names = ordered_antenna_names(self.config['antenna_to_epic_index'])
+        if len(names) != self.nstands:
+            raise ValueError('antenna mapping does not match nstands')
+        return load_itrf_array('antenna_coordinates.csv', names)['positions_m']
 
 
 def main():
